@@ -1,0 +1,27 @@
+paths:
+  data_root: "/scratch/sathishbabu.ki/data_files"
+  cleaned_md: "${paths.data_root}/cleaned_md"
+  embeddings: "${paths.data_root}/embeddings"
+  bm25_artifacts: "${paths.data_root}/bm25_artifacts"
+  outputs: "${paths.data_root}/outputs"
+  logs: "${paths.data_root}/logs/"
+  session_logs: "${paths.data_root}/session_logs"
+  huggingface_home: "/scratch/sathishbabu.ki/vllm_models/vllm/.cache/huggingface"
+  workdir: "/home/sathishbabu.ki/src"
+
+models:
+  embedding: "Qwen/Qwen3-Embedding-8B"
+  reranker: "Qwen/Qwen3-Reranker-8B"
+  generator: "Qwen/Qwen2.5-14B-Instruct-1M"
+
+retrieval:
+  k_papers: 30
+  m_chunks: 20
+  n_reranked: 5
+  bm25_weight: 0.3
+  embedding_weight: 0.7
+  truncate_dim: 1024
+
+generation:
+  temperature: 0.4
+  include_citations: true

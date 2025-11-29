@@ -1,0 +1,23 @@
+[tool.poetry]
+package-mode = false
+
+[project]
+name = "pre-processing-marker"
+version = "0.1.0"
+description = ""
+authors = [
+    {name = "Kishan Sathish Babu"}
+]
+readme = "README.md"
+requires-python = ">=3.11,<4"
+dependencies = [
+    "marker-pdf (>=1.10.1,<2.0.0)",
+    "pdf2image (>=1.17.0,<2.0.0)",
+    "pypdf2 (>=3.0.1,<4.0.0)",
+    "pytesseract (>=0.3.13,<0.4.0)"
+]
+
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
