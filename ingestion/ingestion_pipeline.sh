@@ -43,17 +43,24 @@ export PYTORCH_ALLOC_CONF='expandable_segments:True'
 monitor_gpu_usage() {
     local timestamp=$(date +"%Y%m%d_%H%M%S")
     local log_file="${RAG_LOG_DIR}/gpu_usage_${timestamp}.log"
-    
-    # Ensure log directory exists
+
     mkdir -p "$RAG_LOG_DIR"
-    
-    echo "Monitoring GPU usage. Logs saved to: $log_file"
-    
-    # Run nvidia-smi in the background
+
+    # CSV Header
+    echo "timestamp,memory_used_mb,memory_total_mb,memory_util_pct,gpu_util_pct" > "$log_file"
+
+    echo "Monitoring GPU usage (CSV). Logging to: $log_file"
+
     while true; do
-        echo "Timestamp: $(date)" >> "$log_file"
-        nvidia-smi >> "$log_file"
-        echo "----------------------------------------------------------------" >> "$log_file"
+        local now=$(date +"%Y-%m-%d %H:%M:%S")
+
+        # Query nvidia-smi for a machine-readable output
+        local line=$(nvidia-smi --query-gpu=memory.used,memory.total,utilization.memory,utilization.gpu \
+                                --format=csv,noheader,nounits)
+
+        # line format example: "1024, 11178, 10, 25"
+        echo "$now,$line" >> "$log_file"
+
         sleep 10
     done &
     GPU_MONITOR_PID=$!

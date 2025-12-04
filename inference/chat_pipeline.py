@@ -245,7 +245,7 @@ class RAGPipeline:
         self._load_embedding_search()
         
         t0 = time.perf_counter()
-        emb_results = self.embedding_searcher.search(query, index_num=1, k=k * 2)
+        emb_results = self.embedding_searcher.search(query, collection_num=1, k=k * 2)
         t1 = time.perf_counter()
         if timings is not None:
             timings['embedding'] = timings.get('embedding', 0.0) + (t1 - t0)
@@ -302,7 +302,7 @@ class RAGPipeline:
         t0 = time.perf_counter()
         chunk_results = self.embedding_searcher.search(
             query=query,
-            index_num=2,
+            collection_num=2,
             k=m,
             file_path_filter=file_filter
         )

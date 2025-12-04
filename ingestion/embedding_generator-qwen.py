@@ -1,8 +1,8 @@
-import chromadb
-from chromadb.config import Settings
+import faiss
 import numpy as np
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
+import pickle
 from sentence_transformers import SentenceTransformer
 import torch
 from tqdm import tqdm
@@ -16,7 +16,7 @@ logger = get_ingestion_logger(Path(__file__).stem, max_files=5)
 
 class EmbeddingConfig:
     """Configuration for embedding generation."""
-    MODEL_NAME = "infgrad/Jasper-Token-Compression-600M"
+    MODEL_NAME = "Qwen/Qwen3-Embedding-8B"
     TRUNCATE_DIM = 1024
     DEFAULT_CHUNK_SIZE = 800
     DEFAULT_CHUNK_OVERLAP = 200
@@ -33,7 +33,7 @@ class EmbeddingConfig:
 
 
 class EmbeddingGenerator:
-    """Handles document chunking, embedding generation, and ChromaDB collection building."""
+    """Handles document chunking, embedding generation, and index building."""
     
     def __init__(
         self,
@@ -41,8 +41,7 @@ class EmbeddingGenerator:
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
         truncate_dim: Optional[int] = None,
         default_chunk_size: Optional[int] = None,
-        default_chunk_overlap: Optional[int] = None,
-        persist_directory: Optional[Path] = None
+        default_chunk_overlap: Optional[int] = None
     ):
         """
         Initialize embedding generator.
@@ -53,7 +52,6 @@ class EmbeddingGenerator:
             truncate_dim: Truncate embeddings to this dimension
             default_chunk_size: Default target tokens per chunk
             default_chunk_overlap: Default overlap tokens between chunks
-            persist_directory: Directory to persist ChromaDB (if None, will be set during save)
         """
         # Load defaults from EmbeddingConfig if not provided
         embedding_model_name = embedding_model_name or EmbeddingConfig.MODEL_NAME
@@ -64,14 +62,11 @@ class EmbeddingGenerator:
         self.device = device
         self.default_chunk_size = default_chunk_size
         self.default_chunk_overlap = default_chunk_overlap
-        self.persist_directory = persist_directory
         
         logger.info(f"Loading embedding model '{embedding_model_name}' on {device}")
         
         model_kwargs = {
-            'torch_dtype': torch.bfloat16,
-            'attn_implementation': "sdpa",
-            'trust_remote_code': True
+            'dtype': torch.float16 if device == 'cuda' else torch.float32,
         }
         
         if truncate_dim:
@@ -79,64 +74,27 @@ class EmbeddingGenerator:
                 embedding_model_name, 
                 device=device,
                 truncate_dim=truncate_dim,
-                model_kwargs=model_kwargs,
-                trust_remote_code=True,
-                tokenizer_kwargs={"padding_side": "left"}
+                model_kwargs=model_kwargs
             )
             self.embedding_dim = truncate_dim
         else:
             self.model = SentenceTransformer(
                 embedding_model_name, 
                 device=device,
-                model_kwargs=model_kwargs,
-                trust_remote_code=True,
-                tokenizer_kwargs={"padding_side": "left"}
+                model_kwargs=model_kwargs
             )
             self.embedding_dim = self.model.get_sentence_embedding_dimension()
         
         self.tokenizer = self.model.tokenizer
         
-        # Initialize ChromaDB client (in-memory initially, will persist on save)
-        self.client = None
-        self.collection1 = None
-        self.collection2 = None
+        # Initialize two FAISS indices
+        self.index1 = faiss.IndexFlatL2(self.embedding_dim)
+        self.index2 = faiss.IndexFlatL2(self.embedding_dim)
+        
+        self.metadata1: List[Dict] = []
+        self.metadata2: List[Dict] = []
         
         logger.info(f"Initialized with embedding dimension: {self.embedding_dim}")
-    
-    def _initialize_client(self, persist_directory: Path):
-        """Initialize ChromaDB client with persistence."""
-        if self.client is None:
-            persist_directory.mkdir(parents=True, exist_ok=True)
-            self.client = chromadb.PersistentClient(
-                path=str(persist_directory),
-                settings=Settings(
-                    anonymized_telemetry=False,
-                    allow_reset=True
-                )
-            )
-            
-            # Create or get collections
-            self.collection1 = self.client.get_or_create_collection(
-                name="paper_level",
-                metadata={
-                    "purpose": "paper_level",
-                    "embedding_dim": self.embedding_dim,
-                    "chunking_strategy": EmbeddingConfig.STAGE1_CHUNKING_STRATEGY,
-                    "chunk_size": EmbeddingConfig.STAGE1_CHUNK_SIZE
-                }
-            )
-            
-            self.collection2 = self.client.get_or_create_collection(
-                name="chunk_level",
-                metadata={
-                    "purpose": "chunk_level",
-                    "embedding_dim": self.embedding_dim,
-                    "chunking_strategy": EmbeddingConfig.STAGE2_CHUNKING_STRATEGY,
-                    "chunk_size": EmbeddingConfig.STAGE2_CHUNK_SIZE
-                }
-            )
-            
-            logger.info(f"ChromaDB client initialized at {persist_directory}")
     
     def _normalize_embeddings(self, embeddings: np.ndarray) -> np.ndarray:
         """L2 normalize embeddings for cosine similarity."""
@@ -261,15 +219,13 @@ class EmbeddingGenerator:
                 'chunk_overlap': chunk_overlap,
                 'token_start': start_idx,
                 'token_end': end_idx,
-                'token_length': end_idx - start_idx
+                'token_length': end_idx - start_idx,
+                'total_chunks': num_chunks
             })
             
             chunks.append((chunk_text, chunk_meta))
             start_idx += actual_chunk_size - chunk_overlap
             chunk_index += 1
-        
-        for _, meta in chunks:
-            meta['total_chunks'] = len(chunks)
         
         return chunks
     
@@ -277,17 +233,20 @@ class EmbeddingGenerator:
         self,
         text: str,
         metadata: Dict,
-        target_chunk_size: int,
-        paragraph_overlap: int = 2
+        chunk_size: int,
+        chunk_overlap: int
     ) -> List[Tuple[str, Dict]]:
         """
-        Chunk text by paragraphs with overlap.
+        Chunk text by paragraphs with target token size.
+        
+        Combines consecutive paragraphs until target size is reached.
+        Overlap is in number of paragraphs, not tokens.
         
         Args:
             text: Text to chunk
             metadata: Base metadata
-            target_chunk_size: Target tokens per chunk
-            paragraph_overlap: Number of overlapping paragraphs
+            chunk_size: Target tokens per chunk
+            chunk_overlap: Number of paragraphs to overlap
         
         Returns:
             List of (chunk_text, chunk_metadata) tuples
@@ -304,40 +263,40 @@ class EmbeddingGenerator:
         while i < len(paragraphs):
             current_chunk_paragraphs = []
             current_tokens = 0
-            j = i
+            start_i = i  # Track starting position to prevent infinite loops
             
-            while j < len(paragraphs):
-                para_tokens = len(self.tokenizer.encode(paragraphs[j], add_special_tokens=False))
+            while i < len(paragraphs):
+                para = paragraphs[i]
+                para_tokens = len(self.tokenizer.encode(para, add_special_tokens=False))
                 
-                if current_tokens + para_tokens > target_chunk_size and current_chunk_paragraphs:
+                if current_tokens + para_tokens > chunk_size and current_chunk_paragraphs:
                     break
                 
-                current_chunk_paragraphs.append(paragraphs[j])
+                current_chunk_paragraphs.append(para)
                 current_tokens += para_tokens
-                j += 1
+                i += 1
             
-            if not current_chunk_paragraphs:
-                current_chunk_paragraphs = [paragraphs[i]]
-                j = i + 1
-            
-            chunk_text = '\n\n'.join(current_chunk_paragraphs)
-            
-            chunk_meta = metadata.copy()
-            chunk_meta.update({
-                'chunk_index': chunk_index,
-                'chunk_method': 'paragraph',
-                'target_chunk_size': target_chunk_size,
-                'paragraph_overlap': paragraph_overlap,
-                'paragraph_start': i,
-                'paragraph_end': j,
-                'num_paragraphs': j - i,
-                'token_length': current_tokens
-            })
-            
-            chunks.append((chunk_text, chunk_meta))
-            
-            i = max(i + 1, j - paragraph_overlap)
-            chunk_index += 1
+            if current_chunk_paragraphs:
+                chunk_text = '\n\n'.join(current_chunk_paragraphs)
+                
+                chunk_meta = metadata.copy()
+                chunk_meta.update({
+                    'chunk_index': chunk_index,
+                    'chunk_method': 'paragraph',
+                    'chunk_size': chunk_size,
+                    'chunk_overlap': chunk_overlap,
+                    'num_paragraphs': len(current_chunk_paragraphs),
+                    'token_length': current_tokens
+                })
+                
+                chunks.append((chunk_text, chunk_meta))
+                chunk_index += 1
+                
+                # Calculate overlap: move back by overlap amount, but ensure forward progress
+                overlap_paragraphs = min(chunk_overlap, len(current_chunk_paragraphs) - 1)
+                i = max(i - overlap_paragraphs, start_i + 1)
+            else:
+                break
         
         for _, meta in chunks:
             meta['total_chunks'] = len(chunks)
@@ -345,16 +304,16 @@ class EmbeddingGenerator:
         return chunks
     
     def _embed_texts(
-        self, 
+        self,
         texts: List[str],
         batch_size: int = 8,
         is_query: bool = False
     ) -> np.ndarray:
         """
-        Generate embeddings for a batch of texts.
+        Generate embeddings for texts with Qwen3 prompt format.
         
         Args:
-            texts: List of text strings
+            texts: List of texts to embed
             batch_size: Batch size for encoding
             is_query: Whether texts are queries (vs documents)
         
@@ -371,8 +330,7 @@ class EmbeddingGenerator:
             show_progress_bar=False,
             convert_to_numpy=True,
             normalize_embeddings=True,
-            prompt_name=prompt_name,
-            compression_ratio=0
+            prompt_name=prompt_name
         )
         
         return embeddings
@@ -387,7 +345,7 @@ class EmbeddingGenerator:
         batch_size: int = 8
     ) -> int:
         """
-        Add documents to specified ChromaDB collection.
+        Add documents to specified index.
         
         Args:
             markdown_files: List of markdown file paths
@@ -405,7 +363,8 @@ class EmbeddingGenerator:
         if chunk_overlap is None:
             chunk_overlap = self.default_chunk_overlap
         
-        collection = self.collection1 if index_num == 1 else self.collection2
+        index = self.index1 if index_num == 1 else self.index2
+        metadata_list = self.metadata1 if index_num == 1 else self.metadata2
         
         chunk_fn_map = {
             'fixed': self._chunk_text_fixed,
@@ -418,14 +377,13 @@ class EmbeddingGenerator:
         
         chunk_fn = chunk_fn_map[chunking_strategy]
         
-        logger.info(f"Processing {len(markdown_files)} files for collection {index_num}")
+        logger.info(f"Processing {len(markdown_files)} files for index {index_num}")
         logger.info(f"Strategy: {chunking_strategy}, chunk_size: {chunk_size}, overlap: {chunk_overlap}")
         
         all_chunks = []
         all_metadata = []
-        all_ids = []
         
-        for file_path in tqdm(markdown_files, desc=f"Chunking files for collection {index_num}"):
+        for file_path in tqdm(markdown_files, desc=f"Chunking files for index {index_num}"):
             try:
                 with open(file_path, 'r', encoding='utf-8') as f:
                     text = f.read()
@@ -443,15 +401,8 @@ class EmbeddingGenerator:
                 chunks = chunk_fn(text, base_metadata, chunk_size, chunk_overlap)
                 
                 for chunk_text, chunk_meta in chunks:
-                    # Create unique ID for each chunk
-                    chunk_id = f"{file_path.stem}_idx{index_num}_chunk{chunk_meta['chunk_index']}"
-                    all_ids.append(chunk_id)
                     all_chunks.append(chunk_text)
-                    
-                    # Convert all metadata values to strings/numbers (ChromaDB requirement)
-                    clean_meta = {k: str(v) if not isinstance(v, (int, float, bool)) else v 
-                                  for k, v in chunk_meta.items()}
-                    all_metadata.append(clean_meta)
+                    all_metadata.append(chunk_meta)
                     
             except Exception as e:
                 logger.error(f"Error processing {file_path}: {e}")
@@ -464,38 +415,36 @@ class EmbeddingGenerator:
         logger.info(f"Generating embeddings for {len(all_chunks)} chunks...")
         embeddings = self._embed_texts(all_chunks, batch_size=batch_size, is_query=False)
         
-        # Add to ChromaDB in batches (ChromaDB has a batch size limit)
-        chroma_batch_size = 5000
-        for i in range(0, len(all_chunks), chroma_batch_size):
-            batch_end = min(i + chroma_batch_size, len(all_chunks))
-            collection.add(
-                ids=all_ids[i:batch_end],
-                embeddings=embeddings[i:batch_end].tolist(),
-                documents=all_chunks[i:batch_end],
-                metadatas=all_metadata[i:batch_end]
-            )
-            logger.info(f"Added batch {i//chroma_batch_size + 1}: {batch_end - i} chunks")
+        index.add(embeddings)
+        metadata_list.extend(all_metadata)
         
-        logger.info(f"Added {len(all_chunks)} chunks to collection {index_num}")
+        logger.info(f"Added {len(all_chunks)} chunks to index {index_num}")
         return len(all_chunks)
     
     def save(self, output_path: Path):
-        """
-        Initialize persistence at output path if not already done.
-        ChromaDB automatically persists, so this mainly ensures the client is initialized.
-        """
+        """Save both indices and metadata to disk."""
         output_path = Path(output_path)
+        output_path.mkdir(parents=True, exist_ok=True)
         
-        if self.client is None:
-            self._initialize_client(output_path)
+        faiss.write_index(self.index1, str(output_path / "index1_paper_level.faiss"))
+        faiss.write_index(self.index2, str(output_path / "index2_chunk_level.faiss"))
         
-        # Get collection counts
-        count1 = self.collection1.count() if self.collection1 else 0
-        count2 = self.collection2.count() if self.collection2 else 0
+        with open(output_path / "metadata.pkl", 'wb') as f:
+            pickle.dump({
+                'metadata1': self.metadata1,
+                'metadata2': self.metadata2,
+                'config': {
+                    'embedding_dim': self.embedding_dim,
+                    'default_chunk_size': self.default_chunk_size,
+                    'default_chunk_overlap': self.default_chunk_overlap,
+                    'index1_purpose': 'paper_level',
+                    'index2_purpose': 'chunk_level'
+                }
+            }, f)
         
-        logger.info(f"ChromaDB persisted to {output_path}")
-        logger.info(f"  Collection 1 (paper-level): {count1} vectors")
-        logger.info(f"  Collection 2 (chunk-level): {count2} vectors")
+        logger.info(f"Saved RAG store to {output_path}")
+        logger.info(f"  Index 1 (paper-level): {self.index1.ntotal} vectors")
+        logger.info(f"  Index 2 (chunk-level): {self.index2.ntotal} vectors")
 
 
 def get_optimal_batch_sizes():
@@ -514,10 +463,10 @@ def get_optimal_batch_sizes():
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate embeddings for RAG system using ChromaDB.")
+    parser = argparse.ArgumentParser(description="Generate embeddings for RAG system.")
     parser.add_argument("--stage1_input_dir", type=str, required=True, help="Directory containing markdown files for Stage 1")
     parser.add_argument("--stage2_input_dir", type=str, required=True, help="Directory containing markdown files for Stage 2")
-    parser.add_argument("--output_dir", type=str, required=True, help="Directory to persist ChromaDB")
+    parser.add_argument("--output_dir", type=str, required=True, help="Directory to save embeddings and indices")
     
     args = parser.parse_args()
     
@@ -539,9 +488,8 @@ def main():
     # Set environment variable for better memory management
     os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
     
-    # Initialize generator with persist directory
+    # Initialize generator
     generator = EmbeddingGenerator()
-    generator._initialize_client(output_dir)
     
     # Stage 1: Large chunks for paper-level retrieval
     logger.info("Starting Stage 1: Paper-level indexing...")
@@ -575,7 +523,7 @@ def main():
             batch_size=stage2_batch_size
         )
     
-    # Save (ChromaDB auto-persists, but this logs the final state)
+    # Save indices
     generator.save(output_dir)
     logger.info("Embedding generation completed successfully.")
 

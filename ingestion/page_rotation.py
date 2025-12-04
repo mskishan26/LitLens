@@ -4,6 +4,7 @@ Concurrent PDF Orientation Corrector
 
 Detects and corrects PDF page orientations using Tesseract OSD with parallel processing.
 Optimized for multi-core systems to process multiple PDFs simultaneously.
+Uses PyMuPDF (fitz) instead of pdf2image/poppler for better compatibility.
 """
 
 import os
@@ -19,19 +20,42 @@ import multiprocessing
 
 # PDF processing libraries
 try:
-    from PyPDF2 import PdfReader, PdfWriter
-    from pdf2image import convert_from_path
+    import fitz  # PyMuPDF
     import cv2
     import numpy as np
     from PIL import Image
 except ImportError as e:
     print(f"ERROR: Missing required dependencies: {e}")
-    print("Install with: pip install PyPDF2 pdf2image opencv-python pillow")
+    print("Install with: pip install PyMuPDF opencv-python pillow")
     print("Also ensure tesseract-ocr is installed on your system")
     sys.exit(1)
 
 # Setup logging
 logger = get_ingestion_logger(Path(__file__).stem, max_files=5)
+
+
+def render_page_to_image(page, dpi=300):
+    """
+    Render a PDF page to PIL Image using PyMuPDF.
+    
+    Args:
+        page: fitz.Page object
+        dpi: Resolution for rendering
+    
+    Returns:
+        PIL.Image: Rendered page image
+    """
+    # Calculate zoom factor from DPI (72 is base DPI)
+    zoom = dpi / 72
+    mat = fitz.Matrix(zoom, zoom)
+    
+    # Render page to pixmap
+    pix = page.get_pixmap(matrix=mat, alpha=False)
+    
+    # Convert to PIL Image
+    img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+    
+    return img
 
 
 def detect_page_orientation(page_image, use_preprocessing=True):
@@ -113,22 +137,25 @@ def correct_single_pdf(pdf_path, output_path, confidence_threshold=5.0, dpi=300)
     pdf_name = Path(pdf_path).name
     
     try:
-        # Read PDF
-        reader = PdfReader(pdf_path)
-        num_pages = len(reader.pages)
+        # Open PDF with PyMuPDF
+        doc = fitz.open(pdf_path)
+        num_pages = len(doc)
         
         logger.info(f"Processing {pdf_name} ({num_pages} pages)")
-        
-        # Convert pages to images
-        images = convert_from_path(pdf_path, dpi=dpi)
         
         # Detect orientation for each page
         rotations = {}
         rejected = {}
         
-        for i, image in enumerate(images):
+        for i in range(num_pages):
+            page = doc[i]
+            
+            # Render page to image
+            page_image = render_page_to_image(page, dpi=dpi)
+            
+            # Detect orientation
             rotation, confidence = detect_page_orientation(
-                image, 
+                page_image, 
                 use_preprocessing=True
             )
             
@@ -155,19 +182,21 @@ def correct_single_pdf(pdf_path, output_path, confidence_threshold=5.0, dpi=300)
         if rejected:
             logger.info(f"  Rejected {len(rejected)} low-confidence rotation(s)")
         
-        # Apply rotations and save
-        writer = PdfWriter()
-        for i, page in enumerate(reader.pages):
-            if i in rotations:
-                page.rotate(rotations[i])
-            writer.add_page(page)
+        # Apply rotations using PyMuPDF
+        for page_num, rotation_angle in rotations.items():
+            page = doc[page_num]
+            # PyMuPDF uses counter-clockwise rotation, but we need clockwise
+            # So we negate the angle
+            current_rotation = page.rotation
+            new_rotation = (current_rotation + rotation_angle) % 360
+            page.set_rotation(new_rotation)
         
         # Ensure output directory exists
         output_path.parent.mkdir(parents=True, exist_ok=True)
         
         # Save corrected PDF
-        with open(output_path, 'wb') as f:
-            writer.write(f)
+        doc.save(str(output_path))
+        doc.close()
         
         return {
             'success': True,
@@ -344,32 +373,32 @@ def main():
         description='Correct PDF page orientations in parallel using Tesseract OSD',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-    Examples:
+Examples:
     # Process with 6 workers (default confidence)
-    python page_rotation.py /path/to/input /path/to/output --workers 6
+    python page_rotation.py --input_dir /path/to/input --output_dir /path/to/output --workers 6
     
     # Conservative threshold for fewer false positives
-    python page_rotation.py /path/to/input /path/to/output --confidence 7.0 --workers 8
+    python page_rotation.py --input_dir /path/to/input --output_dir /path/to/output --confidence 7.0 --workers 8
     
     # Higher DPI for better detection (slower)
-    python page_rotation.py /path/to/input /path/to/output --dpi 400 --workers 4
+    python page_rotation.py --input_dir /path/to/input --output_dir /path/to/output --dpi 400 --workers 4
 
-    Naming Convention:
+Naming Convention:
     Input:  /input/subdir/paper.pdf
     Output: /output/paper_subdir.pdf
     
     Input:  /input/paper.pdf (no subdirectory)
     Output: /output/paper.pdf
 
-    Confidence Scale (0-15):
+Confidence Scale (0-15):
     3-5:  Moderate threshold (default: 5.0)
     7-10: Conservative threshold
     Higher values = fewer false positives, more selective rotation
 
-    Dependencies:
-    pip install PyPDF2 pdf2image opencv-python pillow
+Dependencies:
+    pip install PyMuPDF opencv-python pillow
     System: tesseract-ocr (apt-get install tesseract-ocr)
-            """
+        """
     )
     
     parser.add_argument(

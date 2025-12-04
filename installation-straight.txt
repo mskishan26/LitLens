@@ -1,0 +1,31 @@
+# This is to create the environments. There could be a lot of breakage, we moved from cuda 12.1 to cuda 12.8 due to version dependency errors.
+# Build both envs, llm is used for ingestion and inference, marker is only used for ingestion.
+
+
+# Create UV venv
+uv venv --python 3.11 /scratch/sathishbabu.ki/capstone_llm
+source /scratch/sathishbabu.ki/capstone_llm/bin/activate
+
+# Install CUDA 12.1 packages blazingly fast
+uv pip install vllm --torch-backend=cu128
+uv pip install sentence-transformers chromadb
+uv pip install nltk setuptools
+uv pip install rank-bm25
+uv pip install accelerate
+
+deactivate
+
+# Verify
+python -c "import torch; print(torch.version.cuda)"
+python -c "import sys; print(f'Python: {sys.executable}')"
+python -c "import torch; print(f'PyTorch CUDA: {torch.version.cuda}')" 2>/dev/null || echo "PyTorch check failed"
+python -c "import chromadb; print(f'ChromaDB: {chromadb.__version__}')" 2>/dev/null || echo "ChromaDB check failed"
+python -c "import vllm; print(f'vLLM: {vllm.__version__}')" 2>/dev/null || echo "vLLM check failed"
+
+# create marker env
+conda create --prefix=/scratch/sathishbabu.ki/capstone_marker python=3.11 tesseract
+source activate /scratch/sathishbabu.ki/capstone_marker
+pip install uv
+uv pip install marker-pdf pymupdf
+
+conda deactivate
