@@ -12,6 +12,8 @@ uv pip install sentence-transformers chromadb
 uv pip install nltk setuptools
 uv pip install rank-bm25
 uv pip install accelerate
+uv pip install "minicheck @ git+https://github.com/Liyan06/MiniCheck.git@main"
+
 
 deactivate
 
@@ -29,3 +31,5 @@ pip install uv
 uv pip install marker-pdf pymupdf
 
 conda deactivate
+
+# python -c "import torch; print(torch.version.cuda); print(torch.cuda.is_available());"
