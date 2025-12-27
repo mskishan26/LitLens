@@ -25,9 +25,9 @@ from dataclasses import dataclass, field, asdict
 from contextlib import contextmanager
 import uuid
 
-from utils.logger import get_chat_logger
+# from utils.logger import get_chat_logger
 
-logger = get_chat_logger(__name__)
+# logger = get_chat_logger(__name__)
 
 
 @dataclass
@@ -209,7 +209,7 @@ class SessionLogger:
         self._current_entry: Optional[Dict[str, Any]] = None
         self._entry_count = 0
         
-        logger.info(f"Session logger initialized: {self.session_file}")
+        # logger.info(f"Session logger initialized: {self.session_file}")
     
     @staticmethod
     def _generate_session_id() -> str:
@@ -258,7 +258,7 @@ class SessionLogger:
             'error_message': None
         }
         
-        logger.debug(f"Started entry {entry_id}")
+        # logger.debug(f"Started entry {entry_id}")
         return entry_id
     
     def log_bm25_results(
@@ -274,7 +274,7 @@ class SessionLogger:
             scores: Optional list of BM25 scores (if available)
         """
         if self._current_entry is None:
-            logger.warning("No active entry for BM25 results")
+            # logger.warning("No active entry for BM25 results")
             return
         
         bm25_entries = []
@@ -287,7 +287,7 @@ class SessionLogger:
             bm25_entries.append(entry)
         
         self._current_entry['stage1_bm25_results'] = bm25_entries
-        logger.debug(f"Logged {len(bm25_entries)} BM25 results")
+        # logger.debug(f"Logged {len(bm25_entries)} BM25 results")
     
     def log_embedding_stage1_results(
         self,
@@ -300,7 +300,7 @@ class SessionLogger:
             results: List of (distance, metadata, text) tuples from embedding search
         """
         if self._current_entry is None:
-            logger.warning("No active entry for Stage 1 embedding results")
+            # logger.warning("No active entry for Stage 1 embedding results")
             return
         
         emb_entries = []
@@ -315,7 +315,7 @@ class SessionLogger:
             emb_entries.append(entry)
         
         self._current_entry['stage1_embedding_results'] = emb_entries
-        logger.debug(f"Logged {len(emb_entries)} Stage 1 embedding results")
+        # logger.debug(f"Logged {len(emb_entries)} Stage 1 embedding results")
     
     def log_hybrid_scores(
         self,
@@ -340,7 +340,7 @@ class SessionLogger:
             k: Number of papers retrieved per method
         """
         if self._current_entry is None:
-            logger.warning("No active entry for hybrid scores")
+            # logger.warning("No active entry for hybrid scores")
             return
         
         # Build lookup structures
@@ -379,7 +379,7 @@ class SessionLogger:
         
         self._current_entry['stage1_hybrid_scores'] = hybrid_entries
         self._current_entry['stage1_selected_papers'] = list(selected_files)
-        logger.debug(f"Logged {len(hybrid_entries)} hybrid scores, {len(selected_files)} selected")
+        # logger.debug(f"Logged {len(hybrid_entries)} hybrid scores, {len(selected_files)} selected")
     
     def log_chunk_results(
         self,
@@ -392,7 +392,7 @@ class SessionLogger:
             results: List of (distance, metadata, text) tuples
         """
         if self._current_entry is None:
-            logger.warning("No active entry for chunk results")
+            # logger.warning("No active entry for chunk results")
             return
         
         chunk_entries = []
@@ -412,7 +412,7 @@ class SessionLogger:
             chunk_entries.append(entry)
         
         self._current_entry['stage2_chunk_results'] = chunk_entries
-        logger.debug(f"Logged {len(chunk_entries)} chunk results")
+        # logger.debug(f"Logged {len(chunk_entries)} chunk results")
     
     def log_reranker_results(
         self,
@@ -427,7 +427,7 @@ class SessionLogger:
             original_chunks: Original chunks from Stage 2 for comparison
         """
         if self._current_entry is None:
-            logger.warning("No active entry for reranker results")
+            # logger.warning("No active entry for reranker results")
             return
         
         # Build original rank lookup
@@ -463,7 +463,7 @@ class SessionLogger:
             rerank_entries.append(entry)
         
         self._current_entry['stage3_reranked_results'] = rerank_entries
-        logger.debug(f"Logged {len(rerank_entries)} reranked results")
+        # logger.debug(f"Logged {len(rerank_entries)} reranked results")
     
     def log_generation(
         self,
@@ -482,7 +482,7 @@ class SessionLogger:
             prompt_length_tokens: Prompt length in tokens
         """
         if self._current_entry is None:
-            logger.warning("No active entry for generation results")
+            # logger.warning("No active entry for generation results")
             return
         
         self._current_entry['answer'] = answer
@@ -504,7 +504,7 @@ class SessionLogger:
             final_sources.append(source)
         
         self._current_entry['final_sources'] = final_sources
-        logger.debug(f"Logged generation with {len(final_sources)} sources")
+        # logger.debug(f"Logged generation with {len(final_sources)} sources")
     
     def log_timings(self, timings: Dict[str, float]):
         """
@@ -514,7 +514,7 @@ class SessionLogger:
             timings: Dict of {stage_name: seconds}
         """
         if self._current_entry is None:
-            logger.warning("No active entry for timings")
+            # logger.warning("No active entry for timings")
             return
         
         self._current_entry['timings'] = {
@@ -525,7 +525,7 @@ class SessionLogger:
             'hallucination_check_seconds': round(timings.get('hallucination_check', 0), 4),
             'total_seconds': round(sum(timings.values()), 4)
         }
-        logger.debug(f"Logged timings: {self._current_entry['timings']}")
+        # logger.debug(f"Logged timings: {self._current_entry['timings']}")
     
     def log_hallucination_check(self, hallucination_result: Any):
         """
@@ -535,7 +535,7 @@ class SessionLogger:
             hallucination_result: HallucinationResult from hallucination_checker
         """
         if self._current_entry is None:
-            logger.warning("No active entry for hallucination check")
+            # logger.warning("No active entry for hallucination check")
             return
         
         # Convert to dict if it has a to_dict method, otherwise use as-is
@@ -544,7 +544,7 @@ class SessionLogger:
         elif isinstance(hallucination_result, dict):
             result_dict = hallucination_result
         else:
-            logger.warning(f"Unknown hallucination result type: {type(hallucination_result)}")
+            # logger.warning(f"Unknown hallucination result type: {type(hallucination_result)}")
             return
         
         # Store the full result
@@ -558,20 +558,20 @@ class SessionLogger:
             'unsupported_claims': result_dict.get('unsupported_claims', [])
         }
         
-        logger.debug(
-            f"Logged hallucination check: {result_dict.get('num_grounded', 0)}/"
-            f"{result_dict.get('num_claims', 0)} claims grounded"
-        )
+        # logger.debug(
+        #     f"Logged hallucination check: {result_dict.get('num_grounded', 0)}/"
+        #     f"{result_dict.get('num_claims', 0)} claims grounded"
+        # )
 
     def log_error(self, error_message: str):
         """Log an error for the current entry."""
         if self._current_entry is None:
-            logger.warning("No active entry for error")
+            # logger.warning("No active entry for error")
             return
         
         self._current_entry['status'] = 'error'
         self._current_entry['error_message'] = error_message
-        logger.debug(f"Logged error: {error_message}")
+        # logger.debug(f"Logged error: {error_message}")
     
     def finish_entry(self) -> Optional[str]:
         """
@@ -581,7 +581,7 @@ class SessionLogger:
             Entry ID if successful, None otherwise
         """
         if self._current_entry is None:
-            logger.warning("No active entry to finish")
+            # logger.warning("No active entry to finish")
             return None
         
         # Set final status
@@ -596,10 +596,10 @@ class SessionLogger:
                 json.dump(self._current_entry, f, ensure_ascii=False, default=str)
                 f.write('\n')
             
-            logger.info(f"Entry {entry_id} written to {self.session_file}")
+            # logger.info(f"Entry {entry_id} written to {self.session_file}")
             
         except Exception as e:
-            logger.error(f"Failed to write entry {entry_id}: {e}")
+            # logger.error(f"Failed to write entry {entry_id}: {e}")
             return None
         finally:
             self._current_entry = None

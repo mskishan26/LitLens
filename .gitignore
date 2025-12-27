@@ -1,3 +1,7 @@
 .ipynb_checkpoints/
+litlens_inference/
+.files/
+.chainlit/
+logs/
 
 __pycache__

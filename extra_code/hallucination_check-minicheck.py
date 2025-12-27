@@ -2,16 +2,15 @@
 Hallucination Checker Module
 ============================
 
-Uses HHEM-2.1-Open (Vectara's Hallucination Evaluation Model) to verify claims 
-in generated answers against source documents. Each claim is checked against 
-all source documents, and is considered grounded if at least one document 
-supports it.
+Uses MiniCheck-RoBERTa-Large to verify claims in generated answers against
+source documents. Each claim is checked against all source documents, and
+is considered grounded if at least one document supports it.
 
 Flow:
 1. Split generated answer into independent claims using the generator LLM
-2. For each claim, check against each source document using HHEM-2.1
-3. A claim is "grounded" if ANY document supports it (score >= threshold)
-4. A claim is "unsupported" if ALL documents have score < threshold
+2. For each claim, check against each source document using MiniCheck
+3. A claim is "grounded" if ANY document supports it (label=1)
+4. A claim is "unsupported" if ALL documents have label=0
 
 Refactored for:
 - Async generator integration (AsyncQwenGenerator)
@@ -25,7 +24,7 @@ import asyncio
 import time
 import re
 import uuid
-from typing import List, Dict, Optional, Any, AsyncGenerator, Tuple
+from typing import List, Dict, Optional, Any, AsyncGenerator
 from dataclasses import dataclass, field, asdict
 from contextlib import asynccontextmanager
 
@@ -37,9 +36,9 @@ from utils.config_loader import load_config
 logger = get_logger(__name__)
 
 
-
+# =============================================================================
 # Data Classes
-
+# =============================================================================
 
 @dataclass
 class ClaimVerification:
@@ -87,9 +86,9 @@ class HallucinationResult:
         return self.num_unsupported == 0 and self.num_claims > 0
 
 
-
+# =============================================================================
 # Exceptions
-
+# =============================================================================
 
 class HallucinationCheckerError(Exception):
     """Hallucination checker specific exception with context."""
@@ -108,13 +107,13 @@ class HallucinationCheckerError(Exception):
         )
 
 
-
+# =============================================================================
 # Main Hallucination Checker Class
-
+# =============================================================================
 
 class HallucinationChecker:
     """
-    Checks for hallucinations in generated answers using HHEM-2.1-Open.
+    Checks for hallucinations in generated answers using MiniCheck.
     
     Supports both sync and async operation modes:
     - Async: Uses AsyncQwenGenerator for claim splitting (recommended)
@@ -138,13 +137,15 @@ Output ONLY a numbered list of claims, one per line:
 Text to split:
 {answer}"""
 
-    # HHEM configuration
-    DEFAULT_HHEM_MODEL = 'vectara/hallucination_evaluation_model'
+    # MiniCheck configuration
+    DEFAULT_MINICHECK_MODEL = 'roberta-large'
+    DEFAULT_CACHE_DIR = './ckpts'
     
     def __init__(
         self,
         config_path: Optional[str] = None,
-        hhem_model: Optional[str] = None,
+        minicheck_model: Optional[str] = None,
+        cache_dir: Optional[str] = None,
         device: Optional[str] = None,
         grounding_threshold: float = 0.5
     ):
@@ -153,85 +154,83 @@ Text to split:
         
         Args:
             config_path: Path to config file
-            hhem_model: HHEM model name (default: vectara/hallucination_evaluation_model)
+            minicheck_model: MiniCheck model name ('roberta-large', 'deberta-v3-large', etc.)
+            cache_dir: Directory to cache MiniCheck model
             device: Computation device (auto-detected if None)
             grounding_threshold: Minimum probability threshold for grounding (default 0.5)
         """
         self.config = load_config(config_path)
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        self.hhem_model_name = hhem_model or self.DEFAULT_HHEM_MODEL
+        self.minicheck_model_name = minicheck_model or self.DEFAULT_MINICHECK_MODEL
+        self.cache_dir = cache_dir or self.DEFAULT_CACHE_DIR
         self.grounding_threshold = grounding_threshold
         
-        # HHEM model loaded on demand
-        self.hhem_model = None
-        self._hhem_loaded = False
+        # MiniCheck loaded on demand
+        self.minicheck_scorer = None
+        self._minicheck_loaded = False
         
         logger.info(
             f"HallucinationChecker initialized",
             extra={
-                'hhem_model': self.hhem_model_name,
+                'minicheck_model': self.minicheck_model_name,
                 'device': self.device,
                 'grounding_threshold': self.grounding_threshold
             }
         )
     
-   
-    # HHEM Model Management
-   
+    # =========================================================================
+    # MiniCheck Model Management
+    # =========================================================================
     
-    def _load_hhem(self) -> None:
-        """Load HHEM model (lazy loading)."""
-        if self._hhem_loaded:
+    def _load_minicheck(self) -> None:
+        """Load MiniCheck model (lazy loading)."""
+        if self._minicheck_loaded:
             return
         
-        log_stage_start(logger, "hhem_loading", model=self.hhem_model_name)
+        log_stage_start(logger, "minicheck_loading", model=self.minicheck_model_name)
         start_time = time.perf_counter()
         
         try:
-            from transformers import AutoModelForSequenceClassification
+            from minicheck.minicheck import MiniCheck
             
-            self.hhem_model = AutoModelForSequenceClassification.from_pretrained(
-                self.hhem_model_name,
-                trust_remote_code=True
+            self.minicheck_scorer = MiniCheck(
+                model_name=self.minicheck_model_name,
+                cache_dir=self.cache_dir
             )
-            
-            # Move to appropriate device
-            if self.device == "cuda" and torch.cuda.is_available():
-                self.hhem_model = self.hhem_model.to(self.device)
-            
-            self.hhem_model.eval()
-            self._hhem_loaded = True
+            self._minicheck_loaded = True
             
             duration_ms = (time.perf_counter() - start_time) * 1000
             logger.info(
-                f"HHEM model loaded successfully",
-                extra={'duration_ms': duration_ms, 'model': self.hhem_model_name}
+                f"MiniCheck model loaded successfully",
+                extra={'duration_ms': duration_ms, 'model': self.minicheck_model_name}
             )
             
         except ImportError as e:
             raise HallucinationCheckerError(
-                "transformers not installed. Install with: pip install transformers",
+                "MiniCheck not installed. Install with: pip install minicheck",
                 original_error=e
             )
         except Exception as e:
             raise HallucinationCheckerError(
-                f"Failed to load HHEM model: {e}",
+                f"Failed to load MiniCheck model: {e}",
                 original_error=e
             )
     
-    def _unload_hhem(self) -> None:
-        """Unload HHEM model to free memory."""
-        if self.hhem_model is not None:
-            logger.info("Unloading HHEM model")
-            del self.hhem_model
-            self.hhem_model = None
-            self._hhem_loaded = False
+    def _unload_minicheck(self) -> None:
+        """Unload MiniCheck model to free memory."""
+        if self.minicheck_scorer is not None:
+            logger.info("Unloading MiniCheck model")
+            del self.minicheck_scorer
+            self.minicheck_scorer = None
+            self._minicheck_loaded = False
             
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
     
-   
-    # Claim Splitting (Async) 
+    # =========================================================================
+    # Claim Splitting (Async)
+    # =========================================================================
+    
     async def split_into_claims_async(
         self,
         answer: str,
@@ -378,39 +377,9 @@ Text to split:
         
         return unique_claims
     
-   
-    # Claim Verification 
-    def _create_pairs(
-        self,
-        claims: List[str],
-        documents: List[str]
-    ) -> Tuple[List[Tuple[str, str]], List[Tuple[int, int]]]:
-        """
-        Create m x n pairs of (document, claim) for HHEM evaluation.
-        
-        HHEM expects pairs of (premise, hypothesis) where:
-        - premise = source document (evidence)
-        - hypothesis = claim to verify
-        
-        Args:
-            claims: List of claim strings
-            documents: List of source document texts
-        
-        Returns:
-            Tuple of:
-                - List of (premise, hypothesis) pairs
-                - List of (claim_idx, doc_idx) indices for tracking
-        """
-        pairs = []
-        indices = []
-        
-        for claim_idx, claim in enumerate(claims):
-            for doc_idx, doc in enumerate(documents):
-                # HHEM format: (premise, hypothesis) = (document, claim)
-                pairs.append((doc, claim))
-                indices.append((claim_idx, doc_idx))
-        
-        return pairs, indices
+    # =========================================================================
+    # Claim Verification
+    # =========================================================================
     
     def verify_claims(
         self,
@@ -418,7 +387,7 @@ Text to split:
         documents: List[str]
     ) -> List[ClaimVerification]:
         """
-        Verify each claim against all documents using HHEM-2.1.
+        Verify each claim against all documents using MiniCheck.
         
         A claim is considered grounded if at least one document supports it.
         
@@ -446,8 +415,8 @@ Text to split:
                 for i, claim in enumerate(claims)
             ]
         
-        # Load HHEM model
-        self._load_hhem()
+        # Load MiniCheck model
+        self._load_minicheck()
         
         log_stage_start(
             logger, "claim_verification",
@@ -456,67 +425,43 @@ Text to split:
         )
         start_time = time.perf_counter()
         
-        # Create m x n pairs
-        pairs, indices = self._create_pairs(claims, documents)
-        
-        logger.debug(
-            f"Created {len(pairs)} pairs for verification",
-            extra={'num_claims': len(claims), 'num_documents': len(documents)}
-        )
-        
-        try:
-            # Get scores from HHEM - returns tensor of scores between 0-1
-            # Higher score = more consistent (less hallucinated)
-            with torch.no_grad():
-                scores = self.hhem_model.predict(pairs)
-            
-            # Convert to list if tensor
-            if isinstance(scores, torch.Tensor):
-                scores = scores.cpu().tolist()
-            
-        except Exception as e:
-            logger.error(
-                f"HHEM scoring failed",
-                extra={'error': str(e), 'num_pairs': len(pairs)}
-            )
-            # Return all claims as unverifiable
-            return [
-                ClaimVerification(
-                    claim=claim,
-                    claim_index=i,
-                    is_grounded=False,
-                    supporting_docs=[],
-                    doc_scores=[],
-                    max_score=0.0
-                )
-                for i, claim in enumerate(claims)
-            ]
-        
-        # Organize scores by claim
-        # Initialize structure for each claim
-        claim_results = {i: {'doc_scores': [], 'supporting_docs': []} for i in range(len(claims))}
-        
-        for (claim_idx, doc_idx), score in zip(indices, scores):
-            score_float = float(score)
-            
-            claim_results[claim_idx]['doc_scores'].append({
-                'doc_index': doc_idx,
-                'score': score_float,
-                'is_supporting': score_float >= self.grounding_threshold
-            })
-            
-            if score_float >= self.grounding_threshold:
-                claim_results[claim_idx]['supporting_docs'].append(doc_idx)
-        
-        # Build verification results
         verifications = []
+        
         for claim_idx, claim in enumerate(claims):
-            result = claim_results[claim_idx]
-            doc_scores = result['doc_scores']
-            supporting_docs = result['supporting_docs']
+            # Build pairs: each claim against each document
+            docs_for_claim = documents
+            claims_for_scoring = [claim] * len(documents)
             
-            max_score = max((d['score'] for d in doc_scores), default=0.0)
+            try:
+                pred_labels, raw_probs, _, _ = self.minicheck_scorer.score(
+                    docs=docs_for_claim,
+                    claims=claims_for_scoring
+                )
+            except Exception as e:
+                logger.error(
+                    f"MiniCheck scoring failed for claim {claim_idx}",
+                    extra={'error': str(e), 'claim': claim[:100]}
+                )
+                pred_labels = [0] * len(documents)
+                raw_probs = [0.0] * len(documents)
+            
+            # Collect results per document
+            doc_scores = []
+            supporting_docs = []
+            
+            for doc_idx, (label, prob) in enumerate(zip(pred_labels, raw_probs)):
+                doc_scores.append({
+                    'doc_index': doc_idx,
+                    'label': int(label),
+                    'probability': float(prob)
+                })
+                
+                # Use threshold for determining support
+                if label == 1 or prob >= self.grounding_threshold:
+                    supporting_docs.append(doc_idx)
+            
             is_grounded = len(supporting_docs) > 0
+            max_score = max(raw_probs) if raw_probs else 0.0
             
             verification = ClaimVerification(
                 claim=claim,
@@ -524,7 +469,7 @@ Text to split:
                 is_grounded=is_grounded,
                 supporting_docs=supporting_docs,
                 doc_scores=doc_scores,
-                max_score=max_score
+                max_score=float(max_score)
             )
             verifications.append(verification)
             
@@ -549,9 +494,9 @@ Text to split:
         
         return verifications
     
-   
+    # =========================================================================
     # Full Pipeline Methods
-   
+    # =========================================================================
     
     async def check_answer_async(
         self,
@@ -583,7 +528,7 @@ Text to split:
             logger.warning("No claims extracted from answer")
             return self._create_empty_result(answer, start_time)
         
-        # Step 2: Verify each claim (sync - HHEM is not async)
+        # Step 2: Verify each claim (sync - MiniCheck is not async)
         verifications = self.verify_claims(claims, documents)
         
         # Step 3: Aggregate results
@@ -698,14 +643,18 @@ Text to split:
     
     def cleanup(self) -> None:
         """Unload models and free memory."""
-        self._unload_hhem()
+        self._unload_minicheck()
         logger.info("HallucinationChecker cleanup complete")
 
+
+# =============================================================================
 # Context Manager for Resource Management
+# =============================================================================
+
 @asynccontextmanager
 async def hallucination_checker_context(
     config_path: Optional[str] = None,
-    hhem_model: Optional[str] = None,
+    minicheck_model: Optional[str] = None,
     **init_kwargs
 ):
     """
@@ -717,7 +666,7 @@ async def hallucination_checker_context(
     """
     checker = HallucinationChecker(
         config_path=config_path,
-        hhem_model=hhem_model,
+        minicheck_model=minicheck_model,
         **init_kwargs
     )
     
@@ -727,7 +676,10 @@ async def hallucination_checker_context(
         checker.cleanup()
 
 
+# =============================================================================
 # Utility Functions
+# =============================================================================
+
 def format_hallucination_output(
     result: HallucinationResult,
     verbose: bool = False
@@ -746,7 +698,7 @@ def format_hallucination_output(
     
     if result.num_unsupported > 0:
         lines.append(
-            f"\n  Grounding Check: {result.num_grounded}/{result.num_claims} "
+            f"\n⚠️  Grounding Check: {result.num_grounded}/{result.num_claims} "
             f"claims supported ({result.grounding_ratio:.0%})"
         )
         lines.append("\nUnsupported claims:")
@@ -795,9 +747,9 @@ def quick_grounding_check(
         checker.cleanup()
 
 
-
+# =============================================================================
 # Testing
-
+# =============================================================================
 
 if __name__ == "__main__":
     import os
@@ -915,4 +867,4 @@ if __name__ == "__main__":
     test_sync_verification()
     
     # Uncomment to run async test (requires generator setup)
-    asyncio.run(test_with_generator())
+    # asyncio.run(test_with_generator())
