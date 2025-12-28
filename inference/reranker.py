@@ -72,115 +72,105 @@ class Reranker:
         candidates: List[Tuple[float, Dict, str]],
         top_k: int = 5,
         return_scores: bool = True,
-        max_context_tokens: int = 30_000
+        truncate_texts: bool = False,
+        max_candidates: int = 50,
+        batch_size: int = 5,
+        max_context_tokens: int = 2048,  # safety cap
     ) -> Tuple[List[Tuple[float, Dict, str]], Dict[str, Any]]:
         """
-        Core reranking logic.
-        
-        Returns:
-            Tuple containing:
-            1. List of sorted results (score, meta, text)
-            2. Dict of execution metadata (method used, token count, success status)
+        Memory-safe batched reranking using Jina cross-encoder.
+
+        Strategy:
+        - Cap candidates
+        - Batch rerank (query + N docs at a time)
+        - Merge scores
+        - Global sort
         """
         start_time = time.perf_counter()
-        
-        # 1. Validation
+
         if not candidates:
             return [], {"method": "empty_input", "success": True}
 
-        # 2. Extract Texts & Validate
-        texts = []
+        # 1. Sanitize + cap candidates
         valid_candidates = []
-        
-        for dist, meta, chunk_text in candidates:
-            if chunk_text is None:
-                continue 
-            texts.append(chunk_text)
-            valid_candidates.append((dist, meta, chunk_text))
-        
-        if not texts:
+        for dist, meta, text in candidates:
+            if text:
+                valid_candidates.append((dist, meta, text))
+
+        if not valid_candidates:
             return [], {"method": "no_valid_text", "success": False}
 
-        # 3. Context Window Protection
-        total_chars = sum(len(text) for text in texts)
-        estimated_tokens = total_chars / 4
-        
-        # Truncate if necessary (Stage 2 order preserved)
-        if estimated_tokens > max_context_tokens:
-            cumulative_tokens = 0
-            max_candidates = 0
-            for i, text in enumerate(texts):
-                text_tokens = len(text) / 4
-                if cumulative_tokens + text_tokens > max_context_tokens:
-                    break
-                cumulative_tokens += text_tokens
-                max_candidates = i + 1
-            
-            texts = texts[:max_candidates]
-            valid_candidates = valid_candidates[:max_candidates]
+        # Hard cap (important for latency + stability)
+        valid_candidates = valid_candidates[:max_candidates]
 
-        # 4. Cap Candidate Count (Hard limit for cross-encoder speed)
-        max_rerank_candidates = min(100, len(texts))
-        if len(texts) > max_rerank_candidates:
-            texts = texts[:max_rerank_candidates]
-            valid_candidates = valid_candidates[:max_rerank_candidates]
+        texts = [t for _, _, t in valid_candidates]
 
-        # 5. Execution with Timeout
-        method = "jina_rerank"
-        rerank_results = []
-        
+        # 2. Token safety (approximate)
+        def approx_tokens(s: str) -> int:
+            return len(s) // 4
+
+        if truncate_texts:
+            truncated_texts = []
+            for t in texts:
+                if approx_tokens(t) > max_context_tokens:
+                    truncated_texts.append(t[: max_context_tokens * 4])
+                else:
+                    truncated_texts.append(t)
+        else:
+            truncated_texts=texts
+
+        # 3. Batched reranking
+        method = "jina_rerank_batched"
+        all_scores = {}  # global_index -> score
+
         try:
-            future = self._executor.submit(self.model.rerank, query, texts, top_n=None)
-            rerank_results = future.result(timeout=self.timeout_seconds)
-            
-        except (FuturesTimeoutError, Exception) as e:
-            # FALLBACK LOGIC
-            is_timeout = isinstance(e, FuturesTimeoutError)
-            method = "fallback_timeout" if is_timeout else "fallback_error"
-            
+            for start_idx in range(0, len(truncated_texts), batch_size):
+                batch_texts = truncated_texts[start_idx : start_idx + batch_size]
+
+                # IMPORTANT: model.rerank expects a list of documents
+                batch_results = self.model.rerank(
+                    query,
+                    batch_texts,
+                    top_n=None
+                )
+
+                # Map batch-local indices → global indices
+                for r in batch_results:
+                    global_idx = start_idx + r["index"]
+                    all_scores[global_idx] = float(r["relevance_score"])
+
+        except Exception as e:
             logger.error(
-                f"Reranking failed ({method}). Reverting to Stage 2 scores.",
-                exc_info=not is_timeout,  # Don't print stack trace for simple timeouts
-                extra={"error": str(e), "timeout_setting": self.timeout_seconds}
+                "Batched reranking failed, falling back to Stage 2 scores",
+                exc_info=True,
+                extra={"error": str(e)}
             )
-            
-            # Create fake "reranker" results based on original order
-            # We normalize original distances to a fake 0-1 score to maintain API contract
-            # or just return the candidates as is if downstream can handle it.
-            # Here we preserve the list but mark method as fallback.
-            
-            # Simple fallback: Return top_k of the VALID candidates (already sorted by Stage 2)
-            top_results = valid_candidates[:top_k]
-            
-            # If caller expects scores (floats), the original might be distances (unbounded).
-            # We just pass them through, but the 'method' flag warns the caller.
-            return top_results, {
-                "method": method,
+
+            # Fallback: return Stage 2 ordering
+            return valid_candidates[:top_k], {
+                "method": "fallback_error",
                 "success": False,
                 "candidates_processed": len(valid_candidates),
-                "error": str(e)
+                "error": str(e),
             }
 
-        # 6. Process Successful Results
-        # Map Jina results back to valid_candidates indices
-        index_to_score = {r['index']: r['relevance_score'] for r in rerank_results}
-        
-        final_list = []
+        # 4. Merge + global sort
+        reranked = []
         for idx, (_, meta, text) in enumerate(valid_candidates):
-            score = index_to_score.get(idx, 0.0)
-            final_list.append((float(score), meta, text))
-            
-        # Sort by new score
-        final_list.sort(key=lambda x: x[0], reverse=True)
-        final_results = final_list[:top_k]
+            score = all_scores.get(idx, 0.0)
+            reranked.append((score, meta, text))
 
-        execution_time = (time.perf_counter() - start_time) * 1000
-        
+        reranked.sort(key=lambda x: x[0], reverse=True)
+        final_results = reranked[:top_k]
+
+        duration_ms = (time.perf_counter() - start_time) * 1000
+
         return final_results, {
             "method": method,
             "success": True,
-            "candidates_processed": len(texts),
-            "duration_ms": execution_time
+            "candidates_processed": len(valid_candidates),
+            "batch_size": batch_size,
+            "duration_ms": duration_ms,
         }
 
     def rerank_with_details(

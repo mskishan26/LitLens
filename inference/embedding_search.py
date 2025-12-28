@@ -404,7 +404,7 @@ def main():
     from utils.logger import set_request_context, clear_request_context 
     set_request_context(req_id="embed-test", conversation_id="test-session")
     embedding_searcher = EmbeddingSearch()
-    embedding_searcher.load("/mnt/e/data_files/embeddings")
+    embedding_searcher.load("/scratch/sathishbabu.ki/data_files/embeddings")
     
     # Health check
     print("Health check:", embedding_searcher.health_check())

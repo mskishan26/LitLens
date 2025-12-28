@@ -1,5 +1,5 @@
 paths:
-  data_root: "/mnt/e/data_files"
+  data_root: "/scratch/sathishbabu.ki/data_files"
   cleaned_md: "${paths.data_root}/cleaned_md"
   embeddings: "${paths.data_root}/embeddings"
   bm25_artifacts: "${paths.data_root}/bm25_artifacts"
@@ -7,7 +7,7 @@ paths:
   logs: "${paths.data_root}/logs/"
   traces: "${paths.data_root}/logs/"
   session_logs: "${paths.data_root}/session_logs"
-  huggingface_home: "/home/ksathish/llm_models/.cache/huggingface"
+  huggingface_home: "/scratch/sathishbabu.ki/vllm_models/vllm/.cache/huggingface"
   workdir: "/home/ksathish/LitLens"
 
 models:

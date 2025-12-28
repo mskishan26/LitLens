@@ -35,7 +35,7 @@ def test_issue_1_missing_chunk_text():
     """Test Issue #1: Should skip candidates with None chunk_text and log warning."""
     print("\n=== Testing Issue #1: Missing chunk_text ===")
     
-    reranker = Reranker(device='cpu')
+    reranker = Reranker(device='cuda')
     
     # Create candidates with some None chunk_text
     candidates = [
@@ -47,7 +47,7 @@ def test_issue_1_missing_chunk_text():
     ]
     
     query = "test query"
-    results = reranker.rerank(query, candidates, top_k=3)
+    results, run_info = reranker.rerank(query, candidates, top_k=3)
     
     # Should only get 3 valid candidates back (skipped 2 with None)
     assert len(results) == 3, f"Expected 3 results, got {len(results)}"
@@ -64,7 +64,7 @@ def test_issue_3_timeout_fallback():
     """Test Issue #3: Should timeout and fallback to Stage 2 ordering."""
     print("\n=== Testing Issue #3: Timeout with fallback ===")
     
-    reranker = Reranker(device='cpu', timeout_seconds=2)
+    reranker = Reranker(device='cuda', timeout_seconds=2)
     
     candidates = generate_mock_candidates(10)
     query = "test query"
@@ -76,7 +76,7 @@ def test_issue_3_timeout_fallback():
     
     with patch.object(reranker.model, 'rerank', side_effect=hanging_rerank):
         start = time.time()
-        results = reranker.rerank(query, candidates, top_k=5)
+        results, run_info = reranker.rerank(query, candidates, top_k=5)
         elapsed = time.time() - start
         
         # With shutdown(wait=False), should return quickly (~2s)
@@ -97,14 +97,14 @@ def test_issue_3_exception_fallback():
     """Test Issue #3: Should handle exceptions and fallback gracefully."""
     print("\n=== Testing Issue #3: Exception with fallback ===")
     
-    reranker = Reranker(device='cpu')
+    reranker = Reranker(device='cuda')
     
     candidates = generate_mock_candidates(10)
     query = "test query"
     
     # Mock the model.rerank to raise exception
     with patch.object(reranker.model, 'rerank', side_effect=RuntimeError("GPU OOM!")):
-        results = reranker.rerank(query, candidates, top_k=5)
+        results, run_info = reranker.rerank(query, candidates, top_k=5)
         
         # Should return fallback results despite exception
         assert len(results) == 5, f"Expected 5 fallback results, got {len(results)}"
@@ -117,7 +117,7 @@ def test_issue_4_candidate_capping():
     """Test Issue #4: Should cap candidates to 100 for reranking."""
     print("\n=== Testing Issue #4: Candidate capping to 100 ===")
     
-    reranker = Reranker(device='cpu')
+    reranker = Reranker(device='cuda')
     
     # Generate 200 candidates
     candidates = generate_mock_candidates(200)
@@ -134,7 +134,7 @@ def test_issue_4_candidate_capping():
                 for i in range(len(texts))]
     
     with patch.object(reranker.model, 'rerank', side_effect=counting_rerank):
-        results = reranker.rerank(query, candidates, top_k=10)
+        results, run_info = reranker.rerank(query, candidates, top_k=10)
         
         # Should cap to 100 candidates for reranking
         assert rerank_call_count[0] <= 100, f"Reranked {rerank_call_count[0]} candidates, should cap at 100"
@@ -148,7 +148,7 @@ def test_issue_4_context_window_limit():
     """Test Issue #4: Should truncate candidates exceeding context window."""
     print("\n=== Testing Issue #4: Context window protection ===")
     
-    reranker = Reranker(device='cpu')
+    reranker = Reranker(device='cuda')
     
     # Generate candidates that will exceed 100k tokens
     # Each chunk ~2k chars = ~500 tokens, so 250 chunks = ~125k tokens
@@ -163,7 +163,7 @@ def test_issue_4_context_window_limit():
                 for i in range(len(texts))]
     
     with patch.object(reranker.model, 'rerank', side_effect=counting_rerank):
-        results = reranker.rerank(query, large_candidates, top_k=10, max_context_tokens=100000)
+        results, run_info = reranker.rerank(query, large_candidates, top_k=10, max_context_tokens=100000)
         
         # Should truncate to fit context window
         total_chars = sum(len(large_candidates[i][2]) for i in range(rerank_call_count[0]))
@@ -180,7 +180,7 @@ def test_combined_limits():
     """Test that both caps work together: context window + 100 candidate limit."""
     print("\n=== Testing combined limits (context + candidate cap) ===")
     
-    reranker = Reranker(device='cpu')
+    reranker = Reranker(device='cuda')
     
     # 150 candidates with moderate size (~300 chars = ~75 tokens each)
     # Total: ~11,250 tokens (well under 100k limit)
@@ -195,7 +195,7 @@ def test_combined_limits():
                 for i in range(len(texts))]
     
     with patch.object(reranker.model, 'rerank', side_effect=counting_rerank):
-        results = reranker.rerank(query, candidates, top_k=10)
+        results, run_info = reranker.rerank(query, candidates, top_k=10)
         
         # Should cap at 100 (candidate limit), not context limit
         assert rerank_call_count[0] == 100, f"Expected 100 candidates, got {rerank_call_count[0]}"
@@ -208,7 +208,7 @@ def test_normal_operation():
     """Test that normal operation still works with all fixes in place."""
     print("\n=== Testing normal operation ===")
     
-    reranker = Reranker(device='cpu')
+    reranker = Reranker(device='cuda')
     
     candidates = generate_mock_candidates(20)
     query = "test query about important topics"
@@ -219,7 +219,7 @@ def test_normal_operation():
                 for i in range(len(texts))]
     
     with patch.object(reranker.model, 'rerank', side_effect=mock_rerank):
-        results = reranker.rerank(query, candidates, top_k=5)
+        results, run_info = reranker.rerank(query, candidates, top_k=5)
         
         assert len(results) == 5, f"Expected 5 results, got {len(results)}"
         

@@ -219,7 +219,7 @@ class AsyncQwenGenerator:
         system_prompt: Optional[str] = None,
         include_citations: bool = True,
         max_contexts: int = 5,
-        request_id:str = None,
+        request_id:str = 'abc', #None #replace to none later
         **generation_kwargs
     ) -> AsyncGenerator[str, None]:
         """
