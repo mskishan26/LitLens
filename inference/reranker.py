@@ -188,11 +188,15 @@ class Reranker:
         log_stage_start(logger, "reranker", top_k=top_k, input_count=len(candidates))
 
         # 1. OPTIMIZATION: Build O(1) lookup map for original ranks
-        # Using id(meta) ensures we match the specific object instance from Stage 2
-        # Structure: id(meta) -> (original_rank_index, original_distance)
+        # UPDATED: Using 'chroma_id' instead of id(meta)
         original_rank_map = {}
         for idx, (dist, meta, _) in enumerate(candidates):
-            original_rank_map[id(meta)] = (idx + 1, dist)
+            # We use .get() to be safe, assuming 'chroma_id' is a string or number
+            c_id = meta.get('chroma_id')
+            
+            # Only map if the ID exists
+            if c_id is not None:
+                original_rank_map[c_id] = (idx + 1, dist)
 
         # 2. Call Core Rerank
         reranked_results, run_info = self.rerank(
@@ -208,14 +212,17 @@ class Reranker:
         for rank_idx, (score, meta, text) in enumerate(reranked_results):
             current_rank = rank_idx + 1
             
-            # O(1) Lookup
-            orig_info = original_rank_map.get(id(meta))
+            # Retrieve the specific ID from this result's metadata
+            c_id = meta.get('chroma_id')
+            
+            # O(1) Lookup using the ID
+            orig_info = original_rank_map.get(c_id)
             
             if orig_info:
                 orig_rank, orig_dist = orig_info
                 rank_change = orig_rank - current_rank # Positive = Improved
             else:
-                # Should not happen if candidates list wasn't mutated externally
+                # Occurs if chroma_id was missing or candidates list was mutated externally
                 orig_rank, orig_dist, rank_change = (None, None, 0)
 
             detailed_results.append({
@@ -240,7 +247,6 @@ class Reranker:
             count=len(detailed_results),
             duration_ms=duration,
             top_score=top_score,
-            # Extra fields specifically requested
             method=run_info.get('method', 'unknown'),
             fallback_triggered=not run_info.get('success', True),
             candidates_in=len(candidates),

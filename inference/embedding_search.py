@@ -228,6 +228,7 @@ class EmbeddingSearch:
                 for i in range(len(results['ids'][0])):
                     distance = results['distances'][0][i]
                     metadata = results['metadatas'][0][i]
+                    metadata['chroma_id'] = results['ids'][0][i]
                     document = results['documents'][0][i]
                     
                     output.append((float(distance), metadata, document))

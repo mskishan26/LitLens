@@ -229,7 +229,7 @@ class BM25Searcher:
 
             for idx in top_n_indices:
                 filename = self.metadata[idx]['filename']
-                filtered_files.append(filename)
+                filtered_files.append((filename,scores[idx]))
 
             duration_ms = (time.perf_counter() - start_time) * 1000
 
