@@ -3,5 +3,6 @@ litlens_inference/
 .files/
 .chainlit/
 logs/
+traces/
 
 __pycache__
