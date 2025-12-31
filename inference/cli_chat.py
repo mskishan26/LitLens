@@ -18,8 +18,8 @@ if str(project_root) not in sys.path:
 # -----------------------------------------------------------------------------
 # Suppress console logs for cleaner CLI experience
 # DO NOT FORGET TO SET THE HF_HOME VARIABLE, IT WILL REDOWNLOAD TO THE CACHE LOCATION AND EAT YOUR HOME DIR STORAGE
-os.environ['HF_HOME'] = "/scratch/sathishbabu.ki/vllm_models/vllm/.cache/huggingface"
-os.environ['RAG_CONSOLE_LOG_LEVEL'] = 'WARNING'
+os.environ['HF_HOME'] = "/home/ksathish/llm_models/.cache/huggingface"
+os.environ['RAG_CONSOLE_LOG_LEVEL'] = 'INFO'
 os.environ['HF_HUB_DISABLE_PROGRESS_BARS'] = '1'
 os.environ['TQDM_DISABLE'] = '1'
 

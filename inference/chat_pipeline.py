@@ -1,958 +1,622 @@
 """
-Production RAG Pipeline (with JSONL Session Logging)
-=====================================================
+RAG Chat Pipeline V2 - Concurrent Execution
+============================================
 
-Five-stage retrieval pipeline with memory-efficient model loading:
-1. Hybrid retrieval: BM25 + Paper-level embeddings → k papers
-2. Chunk retrieval: Chunk-level embeddings filtered by k papers → m chunks  
-3. Reranking: Qwen reranker → n chunks
-4. Generation: Qwen LLM with context
-5. Hallucination check: MiniCheck verification of claims against sources
+Key improvements over V1:
+1. Retrieval stages (1-3) separated from Generation (4)
+2. GPU semaphore for serialized generation
+3. Reranker auto-offloads to CPU after use
+4. Multiple queries can progress through retrieval while waiting for GPU
 
-Models are loaded/unloaded sequentially to optimize memory usage.
-All stages are logged to JSONL for session replay and debugging.
+Architecture:
+    Query A: [Retrieval] -> [Rerank] -> [===== GENERATING =====]
+    Query B: [Retrieval] -> [Rerank] -> [WAITING] -> [GENERATING]
+                                         ^
+                                         GPU semaphore
 """
 
-import torch
-import gc
-import sys
-from pathlib import Path
-from typing import Dict, Optional, Tuple, Set, List
-from datetime import datetime
+import asyncio
 import time
+import gc
+from pathlib import Path
+from typing import List, Dict, Optional, Set, Any, AsyncGenerator, Tuple
+from dataclasses import dataclass
 
-
-from utils.logger import get_chat_logger
+from utils.logger import (
+    get_logger, 
+    set_request_context, 
+    clear_request_context,
+)
 from utils.config_loader import load_config
 
-logger = get_chat_logger(__name__)
+logger = get_logger(__name__)
 
 
-def clear_gpu_memory():
-    """Aggressively clear GPU cache and run garbage collection."""
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+def reranker_tracer(a: List[Dict]) -> Dict[str, Dict]:
+    """Convert reranker results to tracer format."""
+    tracer_dict = {}
+    for chunk in a:
+        chroma_id = chunk['metadata']['chroma_id']
+        tracer_dict[chroma_id] = {}
+        for metric in ['rank', 'rerank_score', 'original_distance', 'original_rank', 'rank_improvement']:
+            tracer_dict[chroma_id][metric] = chunk.get(metric)
+    return tracer_dict
 
 
-class RAGPipeline:
-    """Memory-efficient RAG pipeline with hybrid retrieval and sequential model loading."""
+@dataclass
+class RetrievalResult:
+    """Container for retrieval stage outputs."""
+    reranked_results: List[Dict]
+    selected_papers: Set[str]
+    trace_id: Optional[str]
+    req_id: str
+    retrieval_duration_ms: float
     
+    # For tracing
+    bm25_output: Optional[Any] = None
+    emb_paper_results: Optional[Any] = None
+    chunk_results: Optional[Any] = None
+    fusion_scores: Optional[Dict] = None
+
+
+class RAGPipelineV2:
+    """
+    Concurrent RAG Pipeline with GPU-serialized generation.
+    """
+
     def __init__(
         self,
         config_path: Optional[str] = None,
-        device: Optional[str] = None,
-        no_unload: bool = False,
-        enable_hallucination_check: bool = True
+        embedding_device: str = "cpu",
+        reranker_device: str = "cuda",
+        generator_device: str = "cuda",
+        hallucination_device: str = "cpu",
+        enable_tracing: bool = True,
+        trace_db_path: str = "traces/request_traces.db",
+        # Concurrency settings
+        max_concurrent_generation: int = 1,
+        reranker_auto_offload: bool = True,
     ):
-        """
-        Initialize pipeline with model configurations from config file.
-        
-        Args:
-            config_path: Path to config file (optional)
-            device: Computation device ('cuda' or 'cpu')
-            no_unload: If True, keep models loaded in memory between queries
-            enable_hallucination_check: If True, run MiniCheck verification on answers
-        """
         self.config = load_config(config_path)
-        self.no_unload = no_unload
-        self.enable_hallucination_check = enable_hallucination_check
         
-        self.embeddings_path = Path(self.config['paths']['embeddings'])
-        self.bm25_artifacts_path = Path(self.config['paths']['bm25_artifacts'])
+        self.paths = self.config['paths']
+        self.models = self.config['models']
+        self.retrieval_conf = self.config['retrieval']
+        self.gen_conf = self.config['generation']
         
-        self.embedding_model = self.config['models']['embedding']
-        self.reranker_model = self.config['models']['reranker']
-        self.generator_model = self.config['models']['generator']
+        # Device configuration
+        self.embedding_device = embedding_device
+        self.reranker_device = reranker_device
+        self.generator_device = generator_device
+        self.hallucination_device = hallucination_device
+        self.reranker_auto_offload = reranker_auto_offload
         
-        self.truncate_dim = self.config['retrieval']['truncate_dim']
-        self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
+        # Components (lazy loaded)
+        self.bm25: Any = None
+        self.embedding: Any = None
+        self.reranker: Any = None
+        self.generator: Any = None
+        self.hallucination_checker: Any = None
+        self.tracer: Any = None
         
-        # Model instances (loaded on-demand)
-        self.bm25_searcher = None
-        self.embedding_searcher = None
-        self.reranker = None
-        self.generator = None
-        self.hallucination_checker = None
+        # Tracing
+        self.enable_tracing = enable_tracing
+        self.trace_db_path = trace_db_path
         
-        # Session logger (initialized per-session)
-        self.session_logger = None
-        
-        logger.info("RAG Pipeline initialized")
-        logger.info(f"  Device: {self.device}")
-        logger.info(f"  Embeddings: {self.embeddings_path}")
-        logger.info(f"  BM25: {self.bm25_artifacts_path}")
-        logger.info(f"  Hallucination check: {self.enable_hallucination_check}")
-        logger.info(f"  No Unload: {self.no_unload}")
+        # GPU SEMAPHORE - Key for concurrent execution
+        self._gpu_semaphore = asyncio.Semaphore(max_concurrent_generation)
+        self._generation_queue_depth = 0
+        self._queue_lock = asyncio.Lock()
 
-        if self.no_unload:
-            self.load_all_models()
-    
-    def init_session_logger(self, session_dir: Optional[Path] = None, session_id: Optional[str] = None):
-        """
-        Initialize session logger for JSONL logging.
+    async def initialize(self):
+        """Initialize all pipeline components with lazy imports."""
+        logger.info("Initializing RAG Pipeline V2 (concurrent mode)...")
         
-        Args:
-            session_dir: Directory for session files (uses config default if None)
-            session_id: Optional custom session ID
-        """
-        from inference.session_logger import SessionLogger
+        import torch 
+        from inference.bm25_search import BM25Searcher
+        from inference.embedding_search import EmbeddingSearch
+        from inference.reranker import Reranker  # Use V2 reranker if available
+        from inference.generator import AsyncQwenGenerator
+        from hallucination_checker import HallucinationChecker
+        from request_tracer import RequestTracer
         
-        session_dir = session_dir or Path(self.config['paths']['session_logs'])
-        self.session_logger = SessionLogger(
-            session_dir=session_dir,
-            session_id=session_id
+        cuda_available = torch.cuda.is_available()
+        if not cuda_available:
+            logger.warning("CUDA not available, forcing all devices to CPU")
+            self.embedding_device = "cpu"
+            self.reranker_device = "cpu"
+            self.generator_device = "cpu"
+            self.hallucination_device = "cpu"
+
+        # 1. Tracer
+        if self.enable_tracing:
+            self.tracer = RequestTracer(db_path=self.trace_db_path)
+
+        # 2. BM25
+        self.bm25 = BM25Searcher(artifacts_dir=self.paths['bm25_artifacts'])
+        self.bm25.load_bm25_artifacts()
+        
+        # 3. Embedding Search
+        self.embedding = EmbeddingSearch(
+            embedding_model_name=self.models['embedding'],
+            device=self.embedding_device,
+            truncate_dim=self.retrieval_conf.get('truncate_dim')
         )
-        logger.info(f"Session logger initialized: {self.session_logger.session_file}")
-        return self.session_logger.session_file
-    
-    def load_all_models(self):
-        """Pre-load all models into memory."""
-        logger.info("Pre-loading all models...")
-        self._load_bm25()
-        self._load_embedding_search()
-        self._load_reranker()
-        self._load_generator()
-        logger.info("All models pre-loaded.")
+        self.embedding.load(Path(self.paths['embeddings']))
+        
+        # 4. Reranker (with auto-offload support)
+        self.reranker = Reranker(
+            model_name=self.models['reranker'],
+            device=self.reranker_device,
+            batch_size=4,
+            timeout_seconds=60,
+            auto_offload=self.reranker_auto_offload,  # NEW
+        )
+        
+        # 5. Generator
+        self.generator = AsyncQwenGenerator(
+            model_name=self.models['generator'],
+            gpu_memory_utilization=0.4,
+            tensor_parallel_size=1
+        )
+        await self.generator.initialize()
+        
+        # 6. Hallucination Checker
+        self.hallucination_checker = HallucinationChecker(
+            generator=self.generator,
+            device=self.hallucination_device,
+            threshold=self.config.get('hallucination', {}).get('threshold', 0.5)
+        )
+        
+        logger.info("Pipeline V2 initialized (concurrent mode enabled)")
 
-    def _load_bm25(self):
-        """Load BM25 search index."""
-        if self.bm25_searcher is None:
-            logger.info("Loading BM25 searcher")
-            from inference.bm25_search import BM25Searcher
-            
-            self.bm25_searcher = BM25Searcher(str(self.bm25_artifacts_path))
-            self.bm25_searcher.load_bm25_artifacts()
-            self._log_memory()
-    
-    def _unload_bm25(self):
-        """Unload BM25 searcher."""
-        if self.no_unload:
-            return
-            
-        if self.bm25_searcher is not None:
-            logger.info("Unloading BM25 searcher")
-            del self.bm25_searcher
-            self.bm25_searcher = None
-            clear_gpu_memory()
-    
-    def _load_embedding_search(self):
-        """Load embedding search system (both indices)."""
-        if self.embedding_searcher is None:
-            logger.info("Loading embedding searcher")
-            from inference.embedding_search import EmbeddingSearch
-            
-            self.embedding_searcher = EmbeddingSearch(
-                embedding_model_name=self.embedding_model,
-                device=self.device,
-                truncate_dim=self.truncate_dim
-            )
-            self.embedding_searcher.load(self.embeddings_path)
-            self._log_memory()
-    
-    def _unload_embedding_search(self):
-        """Unload embedding search system."""
-        if self.no_unload:
-            return
+    async def cleanup(self):
+        """Free all resources."""
+        import torch
+        import torch.distributed as dist
 
-        if self.embedding_searcher is not None:
-            logger.info("Unloading embedding searcher")
-            del self.embedding_searcher.model
-            del self.embedding_searcher
-            self.embedding_searcher = None
-            clear_gpu_memory()
-    
-    def _load_reranker(self):
-        """Load reranker model."""
-        if self.reranker is None:
-            logger.info("Loading reranker")
-            from inference.reranker import Reranker, get_optimal_reranker_batch_size
-            
-            batch_size = get_optimal_reranker_batch_size()
-            self.reranker = Reranker(
-                model_name=self.reranker_model,
-                device=self.device,
-                batch_size=batch_size
-            )
-            self._log_memory()
-    
-    def _unload_reranker(self):
-        """Unload reranker model."""
-        if self.no_unload:
-            return
-
-        if self.reranker is not None:
-            logger.info("Unloading reranker")
-            del self.reranker.model
-            del self.reranker
-            self.reranker = None
-            clear_gpu_memory()
-    
-    def _load_generator(self):
-        """Load generator model."""
-        if self.generator is None:
-            logger.info("Loading generator")
-            from inference.generator import QwenGenerator
-            
-            self.generator = QwenGenerator(
-                model_name=self.generator_model,
-                device=self.device
-            )
-            self._log_memory()
-    
-    def _unload_generator(self):
-        """Unload generator model."""
-        if self.no_unload:
-            return
-
-        if self.generator is not None:
-            logger.info("Unloading generator")
-            del self.generator.model
-            del self.generator
-            self.generator = None
-            clear_gpu_memory()
-    
-    def _load_hallucination_checker(self):
-        """Load hallucination checker (MiniCheck)."""
-        if self.hallucination_checker is None:
-            logger.info("Loading hallucination checker")
-            from inference.hallucination_checker import HallucinationChecker
-            
-            self.hallucination_checker = HallucinationChecker(
-                device=self.device
-            )
-            self._log_memory()
-    
-    def _unload_hallucination_checker(self):
-        """Unload hallucination checker."""
-        if self.no_unload:
-            return
-
-        if self.hallucination_checker is not None:
-            logger.info("Unloading hallucination checker")
+        logger.info("Cleaning up pipeline resources...")
+        
+        if self.hallucination_checker:
             self.hallucination_checker.cleanup()
-            del self.hallucination_checker
             self.hallucination_checker = None
-            clear_gpu_memory()
-    
-    def _check_hallucinations(
-        self,
-        answer: str,
-        contexts: List[Dict],
-        timings: Optional[Dict[str, float]] = None
-    ):
-        """
-        Stage 5: Check for hallucinations using MiniCheck.
         
-        Args:
-            answer: Generated answer text
-            contexts: Reranked contexts with 'text' key
-            timings: Optional timing dict
+        if self.generator:
+            await self.generator.cleanup()
+            self.generator = None
         
-        Returns:
-            HallucinationResult or None if disabled/failed
-        """
-        if not self.enable_hallucination_check:
-            return None
+        if self.tracer:
+            self.tracer.close()
+            self.tracer = None
         
-        logger.info("Stage 5: Hallucination check")
+        self.bm25 = None
+        self.embedding = None
+        self.reranker = None
         
-        self._load_hallucination_checker()
-        
-        t0 = time.perf_counter()
-        try:
-            # Use the generator for claim splitting if it's loaded
-            result = self.hallucination_checker.check_answer(
-                answer=answer,
-                contexts=contexts,
-                generator=self.generator  # May be None, checker will load its own
-            )
-            
-            logger.info(
-                f"  Hallucination check: {result.num_grounded}/{result.num_claims} "
-                f"claims grounded ({result.grounding_ratio:.0%})"
-            )
-            
-        except Exception as e:
-            logger.error(f"Hallucination check failed: {e}", exc_info=True)
-            result = None
-        
-        t1 = time.perf_counter()
-        if timings is not None:
-            timings['hallucination_check'] = timings.get('hallucination_check', 0.0) + (t1 - t0)
-        
-        self._unload_hallucination_checker()
-        
-        return result
-    
-    def _log_memory(self):
-        """Log current GPU memory usage."""
+        gc.collect()
         if torch.cuda.is_available():
-            allocated = torch.cuda.memory_allocated(0) / 1024**3
-            reserved = torch.cuda.memory_reserved(0) / 1024**3
-            logger.debug(f"GPU Memory: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved")
-    
-    def _log_to_session_file(self, file_path: Path, header: str, content: str):
-        """Append formatted log entry to session file (legacy text format)."""
-        if not file_path:
-            return
-            
-        try:
-            with open(file_path, 'a', encoding='utf-8') as f:
-                f.write(f"\n{header}\n")
-                f.write(f"{'-'*len(header)}\n")
-                f.write(f"{content}\n")
-        except Exception as e:
-            logger.error(f"Failed to write to session log: {e}")
+            torch.cuda.empty_cache()
 
-    def _hybrid_retrieval(
+    # =========================================================================
+    # STAGE 1-3: RETRIEVAL (Can run concurrently for multiple queries)
+    # =========================================================================
+    
+    async def _run_retrieval_stages(
         self,
         query: str,
-        k: int,
-        bm25_weight: float,
-        embedding_weight: float,
-        session_file: Optional[Path] = None,
-        timings: Optional[Dict[str, float]] = None
-    ) -> Tuple[Set[str], Dict]:
+        conversation_id: str,
+        req_id: str,
+    ) -> RetrievalResult:
         """
-        Stage 1: Combine BM25 and paper-level embedding search.
+        Run stages 1-3 (BM25, Embedding, Reranking).
         
-        Returns:
-            Tuple of (selected_files set, retrieval_data dict for logging)
+        This method does NOT hold the GPU semaphore, allowing multiple
+        queries to complete retrieval while waiting for generation.
         """
-        logger.info(f"Stage 1: Hybrid retrieval (k={k}, bm25={bm25_weight:.2f}, emb={embedding_weight:.2f})")
+        import torch
+        start_time = time.perf_counter()
+        trace_id = None
         
-        # Validate weights
-        if not abs(bm25_weight + embedding_weight - 1.0) < 1e-6:
-            raise ValueError(f"Weights must sum to 1.0, got {bm25_weight + embedding_weight}")
-        
-        # Data for logging
-        retrieval_data = {
-            'bm25_results': [],
-            'embedding_results': [],
-            'file_scores': {},
-            'bm25_scores': None  # Will store if available
-        }
-        
-        # BM25 search
-        self._load_bm25()
-        
-        t0 = time.perf_counter()
-        bm25_results = self.bm25_searcher.search(query, k=k * 2)  # Get more for combining
-        t1 = time.perf_counter()
-        if timings is not None:
-            timings['bm25'] = timings.get('bm25', 0.0) + (t1 - t0)
-        
-        # Try to get BM25 scores if available
-        try:
-            if hasattr(self.bm25_searcher, 'bm25') and self.bm25_searcher.bm25 is not None:
-                tokenized_query = query.lower().split()
-                scores = self.bm25_searcher.bm25.get_scores(tokenized_query)
-                retrieval_data['bm25_scores'] = scores.tolist() if hasattr(scores, 'tolist') else list(scores)
-        except Exception as e:
-            logger.debug(f"Could not get BM25 scores: {e}")
-            
-        bm25_files = set(bm25_results)
-        retrieval_data['bm25_results'] = bm25_results
-        self._unload_bm25()
-        
-        if session_file:
-            bm25_log = "\n".join([f"{i+1}. {f}" for i, f in enumerate(bm25_results)])
-            self._log_to_session_file(session_file, "BM25 Rankings (Stage 1)", bm25_log)
-        
-        logger.info(f"  BM25 retrieved {len(bm25_files)} papers")
-        
-        # Embedding search (paper-level)
-        self._load_embedding_search()
-        
-        t0 = time.perf_counter()
-        emb_results = self.embedding_searcher.search(query, collection_num=1, k=k * 2)
-        t1 = time.perf_counter()
-        if timings is not None:
-            timings['embedding'] = timings.get('embedding', 0.0) + (t1 - t0)
-            
-        emb_files = {meta['file_path'] for _, meta, _ in emb_results}
-        retrieval_data['embedding_results'] = emb_results
-        
-        if session_file:
-            emb_log = "\n".join([f"{i+1}. {meta.get('file_path', 'unknown')} (score: {dist:.4f})" 
-                               for i, (dist, meta, _) in enumerate(emb_results)])
-            self._log_to_session_file(session_file, "Embedding Rankings (Stage 1)", emb_log)
-        
-        logger.info(f"  Embedding retrieved {len(emb_files)} papers")
-        
-        # Combine results with weighted voting
-        all_files = bm25_files.union(emb_files)
-        file_scores = {}
-        
-        for file in all_files:
-            bm25_score = (k * 2 - bm25_results.index(file)) if file in bm25_results else 0
-            emb_score = 0
-            
-            for idx, (_, meta, _) in enumerate(emb_results):
-                if meta['file_path'] == file:
-                    emb_score = k * 2 - idx
-                    break
-            
-            # Normalize to [0, 1] and apply weights
-            bm25_norm = bm25_score / (k * 2) if k > 0 else 0
-            emb_norm = emb_score / (k * 2) if k > 0 else 0
-            
-            file_scores[file] = bm25_weight * bm25_norm + embedding_weight * emb_norm
-        
-        retrieval_data['file_scores'] = file_scores
-        
-        # Get top-k by combined score
-        top_files = sorted(file_scores.items(), key=lambda x: x[1], reverse=True)[:k]
-        selected_files = {file for file, _ in top_files}
-        
-        logger.info(f"  Combined ranking selected {len(selected_files)} papers")
-        
-        # Log to session logger if available
-        if self.session_logger:
-            self.session_logger.log_bm25_results(bm25_results)
-            self.session_logger.log_embedding_stage1_results(emb_results)
-            self.session_logger.log_hybrid_scores(
-                file_scores=file_scores,
-                bm25_results=bm25_results,
-                emb_results=emb_results,
-                selected_files=selected_files,
-                bm25_weight=bm25_weight,
-                embedding_weight=embedding_weight,
-                k=k
+        # Start tracing
+        if self.tracer:
+            trace_id = self.tracer.start_trace(
+                query=query,
+                conversation_id=conversation_id,
+                req_id=req_id
             )
         
-        return selected_files, retrieval_data
-
-    def _chunk_retrieval(
-        self,
-        query: str,
-        file_filter: Set[str],
-        m: int,
-        timings: Optional[Dict[str, float]] = None
-    ) -> List[Tuple[float, Dict, str]]:
-        """
-        Stage 2: Retrieve chunks from selected papers.
-        """
-        logger.info(f"Stage 2: Chunk retrieval (m={m}, filtered to {len(file_filter)} papers)")
+        # ===== STAGE 1: Hybrid Retrieval =====
+        logger.info(f"[{req_id[:8]}] Stage 1: Hybrid Retrieval")
         
-        # Search chunk-level index with file filter
-        t0 = time.perf_counter()
-        chunk_results = self.embedding_searcher.search(
-            query=query,
+        # BM25
+        bm25_start = time.perf_counter()
+        bm25_output = self.bm25.search(
+            query, 
+            k=self.retrieval_conf['k_papers'] * 2
+        )
+        bm25_results, bm25_scores = map(list, zip(*bm25_output))
+        bm25_duration = (time.perf_counter() - bm25_start) * 1000
+        
+        if self.tracer and trace_id:
+            self.tracer.capture_bm25(trace_id, bm25_output, bm25_duration)
+        
+        # Embedding for Papers
+        emb_start = time.perf_counter()
+        emb_paper_results = self.embedding.search(
+            query, 
+            collection_num=1, 
+            k=self.retrieval_conf['k_papers'] * 2
+        )
+        emb_duration = (time.perf_counter() - emb_start) * 1000
+        
+        emb_tracer = [[item[1].get('chroma_id', 'N/A'), round(item[0], 4)] 
+                      for item in emb_paper_results]
+        
+        if self.tracer and trace_id:
+            self.tracer.capture_embedding_paper(trace_id, emb_tracer, emb_duration)
+        
+        # Hybrid Fusion
+        selected_papers, fusion_scores = self._hybrid_fusion(
+            bm25_results, emb_paper_results, 
+            k=self.retrieval_conf['k_papers'],
+            return_scores=True
+        )
+        
+        if self.tracer and trace_id:
+            self.tracer.capture_hybrid_fusion(trace_id, list(selected_papers), fusion_scores)
+        
+        # ===== STAGE 2: Chunk Retrieval =====
+        logger.info(f"[{req_id[:8]}] Stage 2: Chunk Retrieval")
+        
+        chunk_start = time.perf_counter()
+        chunk_results = self.embedding.search(
+            query,
             collection_num=2,
-            k=m,
-            file_path_filter=file_filter
+            k=self.retrieval_conf['m_chunks'],
+            file_path_filter=selected_papers
         )
-        t1 = time.perf_counter()
-        if timings is not None:
-            timings['embedding'] = timings.get('embedding', 0.0) + (t1 - t0)
+        chunk_duration = (time.perf_counter() - chunk_start) * 1000
         
-        logger.info(f"  Retrieved {len(chunk_results)} chunks")
+        chunk_tracer = [[item[1].get('chroma_id', 'N/A'), round(item[0], 4)] 
+                        for item in chunk_results]
         
-        # Log to session logger if available
-        if self.session_logger:
-            self.session_logger.log_chunk_results(chunk_results)
+        if self.tracer and trace_id:
+            self.tracer.capture_embedding_chunk(trace_id, chunk_tracer, chunk_duration)
         
-        # Unload embedding search now that we're done with retrieval
-        self._unload_embedding_search()
+        # ===== STAGE 3: Reranking =====
+        logger.info(f"[{req_id[:8]}] Stage 3: Reranking")
         
-        return chunk_results
-    
-    def _rerank_chunks(
-        self,
-        query: str,
-        chunks: List[Tuple[float, Dict, str]],
-        n: int,
-        session_file: Optional[Path] = None,
-        timings: Optional[Dict[str, float]] = None
-    ) -> List[Dict]:
-        """
-        Stage 3: Rerank chunks using Qwen reranker.
-        """
-        logger.info(f"Stage 3: Reranking (n={n})")
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         
-        self._load_reranker()
-        
-        t0 = time.perf_counter()
-        reranked = self.reranker.rerank_with_details(
-            query=query,
-            candidates=chunks,
-            top_k=n
+        rerank_start = time.perf_counter()
+        reranked_results = self.reranker.rerank_with_details(
+            query,
+            candidates=chunk_results,
+            top_k=self.retrieval_conf['n_reranked']
         )
-        t1 = time.perf_counter()
-        if timings is not None:
-            timings['reranker'] = timings.get('reranker', 0.0) + (t1 - t0)
+        rerank_duration = (time.perf_counter() - rerank_start) * 1000
         
-        if session_file:
-            rerank_log = ""
-            for item in reranked:
-                rank = item['rank']
-                score = item['rerank_score']
-                title = item['metadata'].get('paper_title', 'Unknown')
-                fname = Path(item['metadata'].get('file_path', '')).name
-                rerank_log += f"{rank}. [{score:.4f}] {title} ({fname})\n"
-            self._log_to_session_file(session_file, "Reranker Rankings (Stage 3)", rerank_log)
+        # NOTE: Reranker auto-offloads to CPU here (if enabled)
+        # This frees GPU memory for the generator
         
-        # Log to session logger if available
-        if self.session_logger:
-            self.session_logger.log_reranker_results(reranked, chunks)
-        
-        logger.info(f"  Selected top {len(reranked)} chunks")
-        
-        self._unload_reranker()
-        
-        return reranked
-    
-    def _generate_answer(
-        self,
-        query: str,
-        contexts: List[Dict],
-        temperature: float,
-        include_citations: bool,
-        timings: Optional[Dict[str, float]] = None
-    ) -> Dict:
-        """
-        Stage 4: Generate answer using Qwen LLM.
-        """
-        logger.info("Stage 4: Generating answer")
-        
-        self._load_generator()
-        
-        t0 = time.perf_counter()
-        response = self.generator.generate(
-            query=query,
-            contexts=contexts,
-            temperature=temperature,
-            include_citations=include_citations
-        )
-        t1 = time.perf_counter()
-        if timings is not None:
-            timings['generator'] = timings.get('generator', 0.0) + (t1 - t0)
-        
-        logger.info(f"  Generated {len(response['answer'].split())} words")
-        
-        # Log to session logger if available
-        if self.session_logger:
-            self.session_logger.log_generation(
-                answer=response['answer'],
-                contexts=contexts,
-                generation_params=response.get('generation_params', {}),
-                prompt_length_tokens=response.get('prompt_length')
+        if self.tracer and trace_id:
+            self.tracer.capture_reranker(
+                trace_id, 
+                reranker_tracer(reranked_results), 
+                rerank_duration
             )
         
-        self._unload_generator()
+        retrieval_duration = (time.perf_counter() - start_time) * 1000
+        logger.info(f"[{req_id[:8]}] Retrieval complete in {retrieval_duration:.0f}ms")
         
-        return response
-    
-    def answer(
-        self,
-        query: str,
-        k: Optional[int] = None,
-        m: Optional[int] = None,
-        n: Optional[int] = None,
-        bm25_weight: Optional[float] = None,
-        embedding_weight: Optional[float] = None,
-        temperature: Optional[float] = None,
-        include_citations: Optional[bool] = None,
-        return_metadata: bool = False,
-        session_file: Optional[Path] = None
-    ) -> Dict:
-        """
-        Answer a question using the full RAG pipeline.
-        """
-        # Use config defaults if not provided
-        k = k or self.config['retrieval']['k_papers']
-        m = m or self.config['retrieval']['m_chunks']
-        n = n or self.config['retrieval']['n_reranked']
-        bm25_weight = bm25_weight if bm25_weight is not None else self.config['retrieval']['bm25_weight']
-        embedding_weight = embedding_weight if embedding_weight is not None else self.config['retrieval']['embedding_weight']
-        temperature = temperature if temperature is not None else self.config['generation']['temperature']
-        include_citations = include_citations if include_citations is not None else self.config['generation']['include_citations']
+        return RetrievalResult(
+            reranked_results=reranked_results,
+            selected_papers=selected_papers,
+            trace_id=trace_id,
+            req_id=req_id,
+            retrieval_duration_ms=retrieval_duration,
+            bm25_output=bm25_output,
+            emb_paper_results=emb_paper_results,
+            chunk_results=chunk_results,
+            fusion_scores=fusion_scores,
+        )
 
-        logger.info("="*80)
-        logger.info(f"Query: {query}")
-        logger.info("="*80)
+    # =========================================================================
+    # STAGE 4: GENERATION (GPU-serialized)
+    # =========================================================================
+    
+    async def _run_generation(
+        self,
+        query: str,
+        retrieval_result: RetrievalResult,
+        enable_hallucination_check: bool = False,
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """
+        Run generation stage under GPU semaphore.
         
-        if session_file:
-            with open(session_file, 'a', encoding='utf-8') as f:
-                f.write("\n" + "="*40 + "\n")
-                f.write(f"Question: {query}\n")
-                f.write("="*40 + "\n")
+        This ensures only one query is generating at a time,
+        while others can complete retrieval stages.
+        """
+        trace_id = retrieval_result.trace_id
+        req_id = retrieval_result.req_id
+        reranked_results = retrieval_result.reranked_results
         
-        start_time = datetime.now()
-        timings = {}
+        # Track queue depth
+        async with self._queue_lock:
+            self._generation_queue_depth += 1
+            queue_pos = self._generation_queue_depth
         
-        # Build config dict for logging
-        config_dict = {
-            'k_papers': k,
-            'm_chunks': m,
-            'n_reranked': n,
-            'bm25_weight': bm25_weight,
-            'embedding_weight': embedding_weight,
-            'temperature': temperature,
-            'include_citations': include_citations
-        }
+        if queue_pos > 1:
+            logger.info(f"[{req_id[:8]}] Waiting for GPU (position {queue_pos} in queue)")
+            yield {"type": "status", "stage": "waiting_for_gpu", "queue_position": queue_pos}
         
-        # Start session logger entry if available
-        if self.session_logger:
-            self.session_logger.start_entry(query, config_dict)
+        wait_start = time.perf_counter()
         
-        try:
-            # Stage 1: Hybrid retrieval
-            selected_papers, retrieval_data = self._hybrid_retrieval(
+        # ===== ACQUIRE GPU SEMAPHORE =====
+        async with self._gpu_semaphore:
+            wait_time = (time.perf_counter() - wait_start) * 1000
+            
+            async with self._queue_lock:
+                self._generation_queue_depth -= 1
+            
+            if wait_time > 100:
+                logger.info(f"[{req_id[:8]}] GPU acquired after {wait_time:.0f}ms wait")
+            
+            # ===== STAGE 4: Generation =====
+            logger.info(f"[{req_id[:8]}] Stage 4: Generation")
+            gen_start = time.perf_counter()
+            
+            accumulated_text = ""
+            token_count = 0
+            ttft = None
+            
+            async for token in self.generator.generate_streaming(
                 query=query,
-                k=k,
-                bm25_weight=bm25_weight,
-                embedding_weight=embedding_weight,
-                session_file=session_file,
-                timings=timings
-            )
+                contexts=reranked_results,
+                temperature=self.gen_conf['temperature'],
+                include_citations=self.gen_conf['include_citations']
+            ):
+                if ttft is None:
+                    ttft = (time.perf_counter() - gen_start) * 1000
+                accumulated_text += token
+                token_count += 1
+                yield {"type": "token", "content": token}
             
-            # Stage 2: Chunk retrieval (need embedding_searcher loaded)
-            chunk_results = self._chunk_retrieval(
-                query=query,
-                file_filter=selected_papers,
-                m=m,
-                timings=timings
-            )
+            gen_duration = (time.perf_counter() - gen_start) * 1000
             
-            # Stage 3: Reranking
-            reranked_chunks = self._rerank_chunks(
-                query=query,
-                chunks=chunk_results,
-                n=n,
-                session_file=session_file,
-                timings=timings
-            )
-            
-            # Stage 4: Generation
-            generation_response = self._generate_answer(
-                query=query,
-                contexts=reranked_chunks,
-                temperature=temperature,
-                include_citations=include_citations,
-                timings=timings
-            )
-            
-            if session_file:
-                self._log_to_session_file(session_file, "Generator Output", generation_response['answer'])
-            
-            # Stage 5: Hallucination check (optional)
-            hallucination_result = None
-            if self.enable_hallucination_check:
-                hallucination_result = self._check_hallucinations(
-                    answer=generation_response['answer'],
-                    contexts=reranked_chunks,
-                    timings=timings
+            if self.tracer and trace_id:
+                self.tracer.capture_generator(
+                    trace_id,
+                    answer=accumulated_text,
+                    duration_ms=gen_duration,
+                    completion_tokens=token_count,
+                    ttft_ms=ttft
                 )
+            
+            # ===== STAGE 5: Hallucination Check (Optional) =====
+            if enable_hallucination_check and self.hallucination_checker:
+                logger.info(f"[{req_id[:8]}] Stage 5: Hallucination Check")
+                hal_start = time.perf_counter()
                 
-                # Log to session logger
-                if self.session_logger and hallucination_result:
-                    self.session_logger.log_hallucination_check(hallucination_result)
+                hal_contexts = [
+                    {"text": r['text'], "metadata": r['metadata']} 
+                    for r in reranked_results
+                ]
                 
-                # Log to session file
-                if session_file and hallucination_result:
-                    from inference.hallucination_checker import format_hallucination_output
-                    hal_log = format_hallucination_output(hallucination_result, verbose=True)
-                    self._log_to_session_file(session_file, "Hallucination Check (Stage 5)", hal_log)
-            
-            # Build response
-            elapsed = (datetime.now() - start_time).total_seconds()
-            
-            # Log timings to session logger
-            if self.session_logger:
-                self.session_logger.log_timings(timings)
-            
-            if session_file:
-                total_exec = sum(timings.values())
-                meta_log = f"total time: {elapsed:.2f}s\n"
-                meta_log += f"total execution time: {total_exec:.2f}s\n"
-                meta_log += f"bm25 step: {timings.get('bm25', 0):.2f}s\n"
-                meta_log += f"embedding step: {timings.get('embedding', 0):.2f}s\n"
-                meta_log += f"reranker step: {timings.get('reranker', 0):.2f}s\n"
-                meta_log += f"generator step: {timings.get('generator', 0):.2f}s\n"
-                meta_log += f"hallucination_check step: {timings.get('hallucination_check', 0):.2f}s\n\n"
+                hallucination_result = await self.hallucination_checker.check(
+                    answer=accumulated_text,
+                    contexts=hal_contexts
+                )
+                hal_duration = (time.perf_counter() - hal_start) * 1000
                 
-                meta_log += f"Papers selected: {len(selected_papers)}\n"
-                meta_log += f"Chunks retrieved: {len(chunk_results)}\n"
-                meta_log += f"Contexts used: {generation_response.get('num_contexts_used', n)}"
-                self._log_to_session_file(session_file, "Metadata", meta_log)
-            
-            response = {
-                'query': query,
-                'answer': generation_response['answer'],
-                'timestamp': datetime.now().isoformat(),
-                'config': config_dict
-            }
-            
-            # Add hallucination result to response
-            if hallucination_result:
-                response['hallucination_check'] = hallucination_result.to_dict()
-            
-            if return_metadata:
-                response['metadata'] = {
-                    'papers_selected': len(selected_papers),
-                    'chunks_retrieved': len(chunk_results),
-                    'contexts_used': generation_response.get('num_contexts_used', n),
-                    'elapsed_seconds': elapsed,
-                    'generation_params': generation_response.get('generation_params', {})
+                if self.tracer and trace_id:
+                    self.tracer.capture_hallucination(
+                        trace_id,
+                        verifications=hallucination_result['verifications'],
+                        grounding_ratio=hallucination_result['grounding_ratio'],
+                        unsupported_claims=hallucination_result['unsupported_claims'],
+                        duration_ms=hal_duration
+                    )
+                
+                yield {
+                    "type": "hallucination",
+                    "grounding_ratio": hallucination_result['grounding_ratio'],
+                    "num_claims": hallucination_result['num_claims'],
+                    "num_grounded": hallucination_result['num_grounded'],
+                    "unsupported_claims": hallucination_result['unsupported_claims'],
+                    "verifications": hallucination_result['verifications']
                 }
-            
-            logger.info("="*80)
-            logger.info(f"Pipeline completed in {elapsed:.2f}s")
-            logger.info("="*80)
-            
-            # Finish session logger entry
-            if self.session_logger:
-                self.session_logger.finish_entry()
-            
-            return response
-            
-        except Exception as e:
-            logger.error(f"Pipeline failed: {e}", exc_info=True)
-            if self.session_logger:
-                self.session_logger.log_error(str(e))
-                self.session_logger.finish_entry()
-            raise
 
-    def answer_streaming(
-        self,
-        query: str,
-        k: Optional[int] = None,
-        m: Optional[int] = None,
-        n: Optional[int] = None,
-        bm25_weight: Optional[float] = None,
-        embedding_weight: Optional[float] = None,
-        temperature: Optional[float] = None,
-        include_citations: Optional[bool] = None,
-        return_metadata: bool = False,
-        session_file: Optional[Path] = None
-    ):
+    # =========================================================================
+    # MAIN ENTRY POINT
+    # =========================================================================
+    
+    async def answer_stream(
+        self, 
+        query: str, 
+        conversation_id: str = "default-session",
+        enable_hallucination_check: bool = False
+    ) -> AsyncGenerator[Dict[str, Any], None]:
         """
-        Answer a question using the full RAG pipeline with streaming output.
+        Process a query through the concurrent RAG pipeline.
         
-        Yields:
-            str: Tokens of the answer
-            dict: Metadata (contexts, etc.) - typically yielded once
+        Flow:
+        1. Retrieval stages run immediately (no GPU lock)
+        2. Generation acquires GPU semaphore (queued if busy)
+        3. Other queries can complete retrieval while waiting
         """
-        # Use config defaults if not provided
-        k = k or self.config['retrieval']['k_papers']
-        m = m or self.config['retrieval']['m_chunks']
-        n = n or self.config['retrieval']['n_reranked']
-        bm25_weight = bm25_weight if bm25_weight is not None else self.config['retrieval']['bm25_weight']
-        embedding_weight = embedding_weight if embedding_weight is not None else self.config['retrieval']['embedding_weight']
-        temperature = temperature if temperature is not None else self.config['generation']['temperature']
-        include_citations = include_citations if include_citations is not None else self.config['generation']['include_citations']
-
-        logger.info("="*80)
-        logger.info(f"Streaming Query: {query}")
-        logger.info("="*80)
-        
-        if session_file:
-            with open(session_file, 'a', encoding='utf-8') as f:
-                f.write("\n" + "="*40 + "\n")
-                f.write(f"Question: {query}\n")
-                f.write("="*40 + "\n")
-        
-        start_time = datetime.now()
-        timings = {}
-        
-        # Build config dict for logging
-        config_dict = {
-            'k_papers': k,
-            'm_chunks': m,
-            'n_reranked': n,
-            'bm25_weight': bm25_weight,
-            'embedding_weight': embedding_weight,
-            'temperature': temperature,
-            'include_citations': include_citations
-        }
-        
-        # Start session logger entry if available
-        if self.session_logger:
-            self.session_logger.start_entry(query, config_dict)
+        start_time = time.perf_counter()
+        req_id = set_request_context(conversation_id=conversation_id)
         
         try:
-            # Stage 1: Hybrid retrieval
-            selected_papers, retrieval_data = self._hybrid_retrieval(
+            # ===== STAGES 1-3: Retrieval (concurrent) =====
+            retrieval_result = await self._run_retrieval_stages(
                 query=query,
-                k=k,
-                bm25_weight=bm25_weight,
-                embedding_weight=embedding_weight,
-                session_file=session_file,
-                timings=timings
+                conversation_id=conversation_id,
+                req_id=req_id,
             )
             
-            # Stage 2: Chunk retrieval
-            chunk_results = self._chunk_retrieval(
-                query=query,
-                file_filter=selected_papers,
-                m=m,
-                timings=timings
-            )
-            
-            # Stage 3: Reranking
-            reranked_chunks = self._rerank_chunks(
-                query=query,
-                chunks=chunk_results,
-                n=n,
-                session_file=session_file,
-                timings=timings
-            )
-            
-            # Yield metadata first so UI can show sources immediately if desired
-            metadata_payload = {
-                'contexts': reranked_chunks,
-                'papers_selected': len(selected_papers),
-                'chunks_retrieved': len(chunk_results)
+            yield {
+                "type": "status", 
+                "stage": "retrieval_complete",
+                "papers_found": len(retrieval_result.selected_papers),
+                "chunks_reranked": len(retrieval_result.reranked_results),
             }
-            yield metadata_payload
             
-            # Stage 4: Generation (Streaming)
-            logger.info("Stage 4: Generating answer (streaming)")
-            self._load_generator()
+            yield {
+                "type": "context", 
+                "data": [
+                    {
+                        "text": r['text'], 
+                        "metadata": r['metadata'], 
+                        "score": r['rerank_score']
+                    } 
+                    for r in retrieval_result.reranked_results
+                ]
+            }
             
-            # We use the generator's streaming method
-            token_generator = self.generator.generate_streaming(
+            # ===== STAGE 4-5: Generation (GPU-serialized) =====
+            async for update in self._run_generation(
                 query=query,
-                contexts=reranked_chunks,
-                temperature=temperature,
-                include_citations=include_citations
-            )
+                retrieval_result=retrieval_result,
+                enable_hallucination_check=enable_hallucination_check,
+            ):
+                yield update
             
-            accumulated_answer = ""
+            # Finish tracing
+            if self.tracer and retrieval_result.trace_id:
+                self.tracer.finish_trace(retrieval_result.trace_id, success=True)
             
-            t0 = time.perf_counter()
-            for token in token_generator:
-                accumulated_answer += token
-                yield token
-            t1 = time.perf_counter()
-            timings['generator'] = timings.get('generator', 0.0) + (t1 - t0)
+            total_duration = (time.perf_counter() - start_time) * 1000
+            logger.info(f"[{req_id[:8]}] Request completed in {total_duration:.0f}ms")
             
-            if session_file:
-                self._log_to_session_file(session_file, "Generator Output", accumulated_answer)
-            
-            # Log generation to session logger
-            if self.session_logger:
-                self.session_logger.log_generation(
-                    answer=accumulated_answer,
-                    contexts=reranked_chunks,
-                    generation_params={'temperature': temperature, 'include_citations': include_citations},
-                    prompt_length_tokens=None  # Not available in streaming mode
-                )
-            
-            self._unload_generator()
-            
-            # Stage 5: Hallucination check (optional)
-            hallucination_result = None
-            if self.enable_hallucination_check:
-                hallucination_result = self._check_hallucinations(
-                    answer=accumulated_answer,
-                    contexts=reranked_chunks,
-                    timings=timings
-                )
-                
-                # Log to session logger
-                if self.session_logger and hallucination_result:
-                    self.session_logger.log_hallucination_check(hallucination_result)
-                
-                # Yield hallucination result so CLI can display it
-                if hallucination_result:
-                    yield {'hallucination_check': hallucination_result}
-            
-            # Log timings after hallucination check
-            if self.session_logger:
-                self.session_logger.log_timings(timings)
-            
-            elapsed = (datetime.now() - start_time).total_seconds()
-            
-            if session_file:
-                total_exec = sum(timings.values())
-                meta_log = f"total time: {elapsed:.2f}s\n"
-                meta_log += f"total execution time: {total_exec:.2f}s\n"
-                meta_log += f"bm25 step: {timings.get('bm25', 0):.2f}s\n"
-                meta_log += f"embedding step: {timings.get('embedding', 0):.2f}s\n"
-                meta_log += f"reranker step: {timings.get('reranker', 0):.2f}s\n"
-                meta_log += f"generator step: {timings.get('generator', 0):.2f}s\n"
-                meta_log += f"hallucination_check step: {timings.get('hallucination_check', 0):.2f}s\n\n"
-                
-                meta_log += f"Papers selected: {len(selected_papers)}\n"
-                meta_log += f"Chunks retrieved: {len(chunk_results)}\n"
-                self._log_to_session_file(session_file, "Metadata", meta_log)
-            
-            logger.info("="*80)
-            logger.info(f"Pipeline completed in {elapsed:.2f}s")
-            logger.info("="*80)
-            
-            # Finish session logger entry
-            if self.session_logger:
-                self.session_logger.finish_entry()
-            
+            yield {
+                "type": "done", 
+                "trace_id": retrieval_result.trace_id,
+                "total_duration_ms": total_duration
+            }
+
         except Exception as e:
-            logger.error(f"Pipeline failed: {e}", exc_info=True)
-            if self.session_logger:
-                self.session_logger.log_error(str(e))
-                self.session_logger.finish_entry()
-            raise
-    
-    def cleanup(self):
-        """Unload all models and free memory."""
-        logger.info("Cleaning up pipeline")
-        # Force unload everything
-        self.no_unload = False
-        self._unload_bm25()
-        self._unload_embedding_search()
-        self._unload_reranker()
-        self._unload_generator()
-        self._unload_hallucination_checker()
-        logger.info("Cleanup complete")
+            logger.error(f"Pipeline Error: {e}", exc_info=True)
+            yield {"type": "error", "message": str(e)}
+        
+        finally:
+            clear_request_context()
+
+    def _hybrid_fusion(
+        self, 
+        bm25_list: List[str], 
+        emb_list: List[Tuple], 
+        k: int,
+        return_scores: bool = False
+    ) -> Tuple[Set[str], Dict[str, float]] | Set[str]:
+        """Fuse BM25 and embedding results using weighted rank fusion."""
+        scores = {}
+        bm25_w = self.retrieval_conf['bm25_weight']
+        emb_w = self.retrieval_conf['embedding_weight']
+        
+        for rank, file_path in enumerate(bm25_list):
+            score = 1.0 - (rank / len(bm25_list))
+            scores[file_path] = scores.get(file_path, 0) + (score * bm25_w)
+
+        for rank, (_, meta, _) in enumerate(emb_list):
+            file_path = meta.get('file_path')
+            if file_path:
+                score = 1.0 - (rank / len(emb_list))
+                scores[file_path] = scores.get(file_path, 0) + (score * emb_w)
+        
+        sorted_files = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+        selected = {f for f, _ in sorted_files[:k]}
+        
+        if return_scores:
+            return selected, scores
+        return selected
+
+    @property
+    def generation_queue_depth(self) -> int:
+        """Number of queries waiting for GPU."""
+        return self._generation_queue_depth
 
 
-def main():
-    """Example usage."""
-    import os
-    import json
+# =============================================================================
+# TEST: Concurrent Query Simulation
+# =============================================================================
+
+async def test_concurrent_execution():
+    """
+    Test that demonstrates concurrent query handling.
     
-    # Optimize memory allocation
-    os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+    Without proper concurrency:
+        Query A (3s) + Query B (2s) = 5s total
     
-    # Initialize pipeline
-    pipeline = RAGPipeline()
+    With concurrent retrieval:
+        Query A: [1s retrieval] [=== 2s generation ===]
+        Query B:     [0.5s retrieval] [wait] [=== 1.5s generation ===]
+        Total: ~3.5s (overlapped retrieval)
+    """
+    print("\n" + "="*70)
+    print("CONCURRENT EXECUTION TEST")
+    print("="*70)
     
-    # Initialize JSONL session logger
-    session_file = pipeline.init_session_logger()
-    print(f"Session logging to: {session_file}")
+    # Mock pipeline that simulates timing
+    class MockPipeline:
+        def __init__(self):
+            self._gpu_semaphore = asyncio.Semaphore(1)
+            self._queue_depth = 0
+        
+        async def process_query(self, name: str, retrieval_time: float, gen_time: float):
+            # Retrieval (no lock)
+            print(f"[{name}] Starting retrieval...")
+            await asyncio.sleep(retrieval_time)
+            print(f"[{name}] Retrieval complete, waiting for GPU...")
+            
+            # Generation (locked)
+            wait_start = time.perf_counter()
+            async with self._gpu_semaphore:
+                wait_time = (time.perf_counter() - wait_start) * 1000
+                if wait_time > 10:
+                    print(f"[{name}] GPU acquired after {wait_time:.0f}ms wait")
+                else:
+                    print(f"[{name}] GPU acquired immediately")
+                
+                print(f"[{name}] === GENERATING ===")
+                await asyncio.sleep(gen_time)
+                print(f"[{name}] === DONE ===")
     
-    # Example query
-    query = "What is matrix suppression and how does it relate to ion competition in mass spectrometry?"
+    pipeline = MockPipeline()
     
-    # Get answer
-    result = pipeline.answer(
-        query=query,
-        return_metadata=True
-    )
+    start = time.perf_counter()
     
-    # Display result
-    print("\n" + "="*80)
-    print("ANSWER")
-    print("="*80)
-    print(result['answer'])
-    print("="*80)
+    # Launch queries with slight offset
+    async def run():
+        task_a = asyncio.create_task(pipeline.process_query("A", 1.0, 2.0))
+        await asyncio.sleep(0.3)  # Query B arrives 0.3s later
+        task_b = asyncio.create_task(pipeline.process_query("B", 0.5, 1.5))
+        await asyncio.gather(task_a, task_b)
     
-    # Save result
-    output_path = Path(pipeline.config['paths']['outputs']) / "rag_output.json"
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+    await run()
     
-    with open(output_path, 'w', encoding='utf-8') as f:
-        json.dump(result, f, indent=2, ensure_ascii=False)
+    total = time.perf_counter() - start
+    sequential = 1.0 + 2.0 + 0.5 + 1.5  # 5s
     
-    logger.info(f"Saved result to {output_path}")
-    
-    # Cleanup
-    pipeline.cleanup()
+    print(f"\n{'='*70}")
+    print(f"Total time: {total:.2f}s")
+    print(f"Sequential would be: {sequential:.1f}s")
+    print(f"Time saved: {sequential - total:.2f}s ({(1 - total/sequential)*100:.0f}% faster)")
+    print(f"{'='*70}\n")
 
 
 if __name__ == "__main__":
-    main()
+    import os
+    import multiprocessing as mp
+    
+    try:
+        mp.set_start_method('spawn', force=True)
+    except RuntimeError:
+        pass
+    
+    os.environ['PYTORCH_ALLOC_CONF'] = 'expandable_segments:True'
+    
+    # Run concurrent test
+    asyncio.run(test_concurrent_execution())

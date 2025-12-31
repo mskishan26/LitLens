@@ -1,522 +1,242 @@
 """
-Hallucination Checker Module
-=============================
-
-Uses MiniCheck-RoBERTa-Large to verify claims in generated answers against
-source documents. Each claim is checked against all source documents, and
-is considered grounded if at least one document supports it.
-
-Flow:
-1. Split generated answer into independent claims using the generator LLM
-2. For each claim, check against each source document using MiniCheck
-3. A claim is "grounded" if ANY document supports it (label=1)
-4. A claim is "unsupported" if ALL documents have label=0
+Hallucination Checker - Simplified
+Uses HHEM-2.1-Open to verify claims against source documents.
 """
 
 import torch
-from typing import List, Dict, Optional, Tuple, Any
-from dataclasses import dataclass, field, asdict
 import re
-import os
+import uuid
+import time
+from typing import List, Dict, Optional, Any
+from vllm.sampling_params import SamplingParams
 
-from utils.logger import get_chat_logger
+from utils.logger import get_logger
 from utils.config_loader import load_config
 
-logger = get_chat_logger(__name__)
-os.environ['TQDM_DISABLE'] = '1'
+logger = get_logger(__name__)
 
+CLAIM_SPLIT_PROMPT = """Split this text into independent, atomic claims. Output ONLY a numbered list:
 
-@dataclass
-class ClaimVerification:
-    """Verification result for a single claim."""
-    claim: str
-    claim_index: int
-    is_grounded: bool  # True if ANY document supports it
-    supporting_docs: List[int]  # Indices of documents that support this claim
-    doc_scores: List[Dict[str, Any]]  # Detailed scores per document
-    max_score: float  # Highest probability score across all docs
-    
-    def to_dict(self) -> Dict:
-        return asdict(self)
-
-
-@dataclass
-class HallucinationResult:
-    """Complete hallucination check result for an answer."""
-    answer: str
-    claims: List[str]
-    verifications: List[ClaimVerification]
-    num_claims: int
-    num_grounded: int
-    num_unsupported: int
-    grounding_ratio: float  # num_grounded / num_claims
-    unsupported_claims: List[str]  # List of claims that are not grounded
-    
-    def to_dict(self) -> Dict:
-        return {
-            'answer': self.answer,
-            'claims': self.claims,
-            'verifications': [v.to_dict() for v in self.verifications],
-            'num_claims': self.num_claims,
-            'num_grounded': self.num_grounded,
-            'num_unsupported': self.num_unsupported,
-            'grounding_ratio': self.grounding_ratio,
-            'unsupported_claims': self.unsupported_claims
-        }
+Text: {answer}"""
 
 
 class HallucinationChecker:
-    """
-    Checks for hallucinations in generated answers using MiniCheck.
+    """Checks for hallucinations using HHEM-2.1-Open."""
     
-    Uses a two-step process:
-    1. Split answer into claims using the generator model
-    2. Verify each claim against source documents using MiniCheck
-    """
-    
-    CLAIM_SPLIT_PROMPT = """Split the following text into independent, atomic claims. Each claim should:
-- Be a single, self-contained statement
-- Be verifiable against source documents
-- Not depend on other claims for context
-
-Output ONLY a numbered list of claims, one per line, in the format:
-1. [claim]
-2. [claim]
-...
-
-Do not include any other text or explanation.
-
-Text to split:
-{answer}"""
-
     def __init__(
         self,
+        generator: "AsyncQwenGenerator",
         config_path: Optional[str] = None,
-        minicheck_model: str = 'roberta-large',
-        cache_dir: str = './ckpts',
-        device: str = "cuda" if torch.cuda.is_available() else "cpu"
+        hhem_model: str = "vectara/hallucination_evaluation_model",
+        device: Optional[str] = None,
+        threshold: float = 0.5
     ):
-        """
-        Initialize hallucination checker.
-        
-        Args:
-            config_path: Path to config file
-            minicheck_model: MiniCheck model name ('roberta-large', 'deberta-v3-large', etc.)
-            cache_dir: Directory to cache MiniCheck model
-            device: Computation device
-        """
         self.config = load_config(config_path)
-        self.device = device
-        self.minicheck_model_name = minicheck_model
-        self.cache_dir = self.config['paths']['huggingface_home'] #changed this dont want it in my source code dir
-        
-        # Models loaded on demand
-        self.minicheck_scorer = None
-        self._minicheck_loaded = False
-        
-        logger.info(f"HallucinationChecker initialized")
-        logger.info(f"  MiniCheck model: {minicheck_model}")
-        logger.info(f"  Device: {device}")
+        self.generator = generator
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.hhem_model_name = hhem_model
+        self.threshold = threshold
+        self.hhem_model = None
     
-    def _load_minicheck(self):
-        """Load MiniCheck model."""
-        if self._minicheck_loaded:
+    def _load_hhem(self) -> None:
+        """Lazy load HHEM model."""
+        if self.hhem_model is not None:
             return
         
-        logger.info(f"Loading MiniCheck model: {self.minicheck_model_name}")
-        try:
-            from minicheck.minicheck import MiniCheck
-            
-            self.minicheck_scorer = MiniCheck(
-                model_name=self.minicheck_model_name,
-                cache_dir=self.cache_dir
-            )
-            self._minicheck_loaded = True
-            logger.info("MiniCheck model loaded successfully")
-            
-        except ImportError as e:
-            logger.error(f"Failed to import MiniCheck: {e}")
-            logger.error("Install with: pip install minicheck")
-            raise
-        except Exception as e:
-            logger.error(f"Failed to load MiniCheck: {e}")
-            raise
-    
-    def _unload_minicheck(self):
-        """Unload MiniCheck model to free memory."""
-        if self.minicheck_scorer is not None:
-            logger.info("Unloading MiniCheck model")
-            del self.minicheck_scorer
-            self.minicheck_scorer = None
-            self._minicheck_loaded = False
-            
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-    
-    def split_into_claims(
-        self, 
-        answer: str, 
-        generator=None
-    ) -> List[str]:
-        """
-        Split an answer into independent claims using the generator LLM.
+        from transformers import AutoModelForSequenceClassification
         
-        Args:
-            answer: Generated answer text
-            generator: QwenGenerator instance (if None, will load one)
+        self.hhem_model = AutoModelForSequenceClassification.from_pretrained(
+            self.hhem_model_name,
+            trust_remote_code=True
+        )
         
-        Returns:
-            List of claim strings
-        """
+        if self.device == "cuda" and torch.cuda.is_available():
+            self.hhem_model = self.hhem_model.to(self.device)
+        
+        self.hhem_model.eval()
+        logger.info(f"HHEM model loaded: {self.hhem_model_name}")
+    
+    async def _split_claims(self, answer: str) -> List[str]:
+        """Split answer into claims using the generator."""
         if not answer or not answer.strip():
             return []
         
-        logger.info(f"Splitting answer into claims (length: {len(answer)} chars)")
-        
-        # Build prompt for claim splitting
-        prompt = self.CLAIM_SPLIT_PROMPT.format(answer=answer)
-        
-        # Use provided generator or load one
-        own_generator = False
-        if generator is None:
-            logger.info("Loading generator for claim splitting")
-            from inference.generator import QwenGenerator
-            generator = QwenGenerator(device=self.device)
-            own_generator = True
+        messages = [
+            {"role": "system", "content": "You split text into atomic claims. Output ONLY a numbered list."},
+            {"role": "user", "content": CLAIM_SPLIT_PROMPT.format(answer=answer)}
+        ]
         
         try:
-            # Generate claims using a simple message format
-            messages = [
-                {"role": "system", "content": "You are a helpful assistant that splits text into atomic claims."},
-                {"role": "user", "content": prompt}
-            ]
-            
-            prompt_text = generator.tokenizer.apply_chat_template(
+            prompt = self.generator.tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=False
+            )
+        except TypeError:
+            # Fallback if tokenizer doesn't support enable_thinking
+            prompt = self.generator.tokenizer.apply_chat_template(
                 messages,
                 tokenize=False,
                 add_generation_prompt=True
             )
-            
-            with torch.no_grad():
-                inputs = generator.tokenizer([prompt_text], return_tensors="pt").to(generator.device)
-                
-                outputs = generator.model.generate(
-                    **inputs,
-                    max_new_tokens=1024,
-                    temperature=0.1,  # Low temperature for consistent splitting
-                    do_sample=True,
-                    pad_token_id=generator.tokenizer.eos_token_id
-                )
-                
-                generated_ids = outputs[0][inputs['input_ids'].shape[1]:]
-                claims_text = generator.tokenizer.decode(generated_ids, skip_special_tokens=True)
-            
-            # Parse claims from numbered list
-            claims = self._parse_claims(claims_text)
-            logger.info(f"Extracted {len(claims)} claims")
-            
-            return claims
-            
-        finally:
-            if own_generator:
-                generator.cleanup()
-    
-    def _parse_claims(self, claims_text: str) -> List[str]:
-        """
-        Parse claims from LLM output.
         
-        Args:
-            claims_text: Raw text output from LLM
+        sampling_params = SamplingParams(
+            temperature=0.1,
+            top_p=0.9,
+            max_tokens=1024,
+            skip_special_tokens=True
+        )
         
-        Returns:
-            List of cleaned claim strings
-        """
+        request_id = str(uuid.uuid4())
+        claims_text = ""
+        
+        async for output in self.generator.engine.generate(prompt, sampling_params, request_id=request_id):
+            claims_text = output.outputs[0].text
+        
+        # Parse numbered list
         claims = []
-        
-        # Try numbered list format first: "1. claim" or "1) claim"
-        pattern = r'^\s*\d+[\.\)]\s*(.+)$'
-        
         for line in claims_text.strip().split('\n'):
-            line = line.strip()
-            if not line:
-                continue
-            
-            match = re.match(pattern, line)
+            match = re.match(r'^\s*\d+[\.\)]\s*(.+)$', line.strip())
             if match:
                 claim = match.group(1).strip()
-                if claim and len(claim) > 5:  # Filter out very short claims
+                if claim and len(claim) > 5:
                     claims.append(claim)
-            elif line and not line[0].isdigit():
-                # Fallback: treat non-numbered lines as claims if they're substantial
-                if len(line) > 20:  # Minimum length for a claim
-                    claims.append(line)
         
-        # Deduplicate while preserving order
+        # Deduplicate
         seen = set()
-        unique_claims = []
-        for claim in claims:
-            claim_lower = claim.lower()
-            if claim_lower not in seen:
-                seen.add(claim_lower)
-                unique_claims.append(claim)
-        
-        return unique_claims
+        return [c for c in claims if not (c.lower() in seen or seen.add(c.lower()))]
     
-    def verify_claims(
-        self,
-        claims: List[str],
-        documents: List[str]
-    ) -> List[ClaimVerification]:
-        """
-        Verify each claim against all documents using MiniCheck.
-        
-        A claim is considered grounded if at least one document supports it.
-        
-        Args:
-            claims: List of claim strings
-            documents: List of source document texts
-        
-        Returns:
-            List of ClaimVerification results
-        """
+    def _verify_claims(self, claims: List[str], documents: List[str]) -> List[Dict]:
+        """Verify claims against documents using HHEM."""
         if not claims:
             return []
         
         if not documents:
-            logger.warning("No documents provided for verification")
             return [
-                ClaimVerification(
-                    claim=claim,
-                    claim_index=i,
-                    is_grounded=False,
-                    supporting_docs=[],
-                    doc_scores=[],
-                    max_score=0.0
-                )
-                for i, claim in enumerate(claims)
+                {"claim": c, "is_grounded": False, "max_score": 0.0, "supporting_docs": []}
+                for c in claims
             ]
         
-        self._load_minicheck()
+        self._load_hhem()
         
-        logger.info(f"Verifying {len(claims)} claims against {len(documents)} documents")
+        # Create (doc, claim) pairs
+        pairs = [(doc, claim) for claim in claims for doc in documents]
         
-        verifications = []
+        with torch.no_grad():
+            scores = self.hhem_model.predict(pairs)
         
-        for claim_idx, claim in enumerate(claims):
-            # Build pairs: each claim against each document
-            docs_for_claim = documents  # All documents
-            claims_for_scoring = [claim] * len(documents)  # Same claim repeated
-            
-            # Score all pairs at once for efficiency
-            try:
-                pred_labels, raw_probs, _, _ = self.minicheck_scorer.score(
-                    docs=docs_for_claim,
-                    claims=claims_for_scoring
-                )
-            except Exception as e:
-                logger.error(f"MiniCheck scoring failed for claim {claim_idx}: {e}")
-                pred_labels = [0] * len(documents)
-                raw_probs = [0.0] * len(documents)
-            
-            # Collect results per document
-            doc_scores = []
-            supporting_docs = []
-            
-            for doc_idx, (label, prob) in enumerate(zip(pred_labels, raw_probs)):
-                doc_scores.append({
-                    'doc_index': doc_idx,
-                    'label': int(label),
-                    'probability': float(prob)
-                })
-                
-                if label == 1:
-                    supporting_docs.append(doc_idx)
-            
-            # A claim is grounded if ANY document supports it
-            is_grounded = len(supporting_docs) > 0
-            max_score = max(raw_probs) if raw_probs else 0.0
-            
-            verification = ClaimVerification(
-                claim=claim,
-                claim_index=claim_idx,
-                is_grounded=is_grounded,
-                supporting_docs=supporting_docs,
-                doc_scores=doc_scores,
-                max_score=float(max_score)
-            )
-            verifications.append(verification)
-            
-            logger.debug(
-                f"Claim {claim_idx}: grounded={is_grounded}, "
-                f"supporting_docs={supporting_docs}, max_score={max_score:.4f}"
-            )
+        if isinstance(scores, torch.Tensor):
+            scores = scores.cpu().tolist()
         
-        return verifications
+        # Organize scores by claim
+        num_docs = len(documents)
+        results = []
+        
+        for i, claim in enumerate(claims):
+            claim_scores = scores[i * num_docs : (i + 1) * num_docs]
+            supporting = [j for j, s in enumerate(claim_scores) if s >= self.threshold]
+            max_score = max(claim_scores) if claim_scores else 0.0
+            
+            results.append({
+                "claim": claim,
+                "is_grounded": len(supporting) > 0,
+                "max_score": float(max_score),
+                "supporting_docs": supporting
+            })
+        
+        return results
     
-    def check_answer(
-        self,
-        answer: str,
-        contexts: List[Dict],
-        generator=None
-    ) -> HallucinationResult:
+    async def check(self, answer: str, contexts: List[Dict]) -> Dict[str, Any]:
         """
-        Full hallucination check pipeline.
+        Check answer for hallucinations.
         
-        Args:
-            answer: Generated answer text
-            contexts: List of context dicts from reranker (with 'text' key)
-            generator: Optional QwenGenerator instance for claim splitting
-        
-        Returns:
-            HallucinationResult with all verification details
+        Returns dict with: claims, verifications, grounding_ratio, unsupported_claims
         """
-        logger.info("Starting hallucination check")
+        start = time.perf_counter()
         
-        # Extract document texts from contexts
+        # Extract document texts
         documents = []
         for ctx in contexts:
-            if isinstance(ctx, dict):
-                text = ctx.get('text', '')
-                if text:
-                    documents.append(text)
-            elif isinstance(ctx, str):
-                documents.append(ctx)
+            text = ctx.get('text', '') if isinstance(ctx, dict) else ctx
+            if text:
+                documents.append(text)
         
-        if not documents:
-            logger.warning("No valid documents found in contexts")
-        
-        logger.info(f"Extracted {len(documents)} documents from contexts")
-        
-        # Step 1: Split answer into claims
-        claims = self.split_into_claims(answer, generator)
+        # Split into claims
+        try:
+            claims = await self._split_claims(answer)
+        except Exception as e:
+            logger.warning(f"LLM claim splitting failed, using fallback: {e}")
+            # Fallback: simple sentence splitting
+            sentences = re.split(r'(?<=[.!?])\s+', answer.strip())
+            claims = [s.strip() for s in sentences if len(s.strip()) > 20]
         
         if not claims:
-            logger.warning("No claims extracted from answer")
-            return HallucinationResult(
-                answer=answer,
-                claims=[],
-                verifications=[],
-                num_claims=0,
-                num_grounded=0,
-                num_unsupported=0,
-                grounding_ratio=1.0,  # No claims = nothing to verify
-                unsupported_claims=[]
-            )
+            return {
+                "answer": answer,
+                "claims": [],
+                "verifications": [],
+                "num_claims": 0,
+                "num_grounded": 0,
+                "grounding_ratio": 1.0,
+                "unsupported_claims": [],
+                "duration_ms": (time.perf_counter() - start) * 1000
+            }
         
-        # Step 2: Verify each claim
-        verifications = self.verify_claims(claims, documents)
+        # Verify
+        verifications = self._verify_claims(claims, documents)
         
-        # Step 3: Aggregate results
-        num_grounded = sum(1 for v in verifications if v.is_grounded)
-        num_unsupported = len(verifications) - num_grounded
-        unsupported_claims = [v.claim for v in verifications if not v.is_grounded]
+        num_grounded = sum(1 for v in verifications if v["is_grounded"])
+        unsupported = [v["claim"] for v in verifications if not v["is_grounded"]]
         
-        grounding_ratio = num_grounded / len(claims) if claims else 1.0
-        
-        result = HallucinationResult(
-            answer=answer,
-            claims=claims,
-            verifications=verifications,
-            num_claims=len(claims),
-            num_grounded=num_grounded,
-            num_unsupported=num_unsupported,
-            grounding_ratio=grounding_ratio,
-            unsupported_claims=unsupported_claims
-        )
-        
-        logger.info(
-            f"Hallucination check complete: "
-            f"{num_grounded}/{len(claims)} claims grounded ({grounding_ratio:.1%})"
-        )
-        
-        return result
+        return {
+            "answer": answer,
+            "claims": claims,
+            "verifications": verifications,
+            "num_claims": len(claims),
+            "num_grounded": num_grounded,
+            "grounding_ratio": num_grounded / len(claims),
+            "unsupported_claims": unsupported,
+            "duration_ms": (time.perf_counter() - start) * 1000
+        }
     
-    def cleanup(self):
-        """Unload models and free memory."""
-        self._unload_minicheck()
+    def cleanup(self) -> None:
+        """Free HHEM model memory."""
+        if self.hhem_model is not None:
+            del self.hhem_model
+            self.hhem_model = None
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
 
-def format_hallucination_output(result: HallucinationResult, verbose: bool = False) -> str:
-    """
-    Format hallucination check result for display.
-    
-    Args:
-        result: HallucinationResult from checker
-        verbose: If True, show all claims; if False, only unsupported
-    
-    Returns:
-        Formatted string for display
-    """
-    lines = []
-    
-    if result.num_unsupported > 0:
-        lines.append(f"\n⚠️  Grounding Check: {result.num_grounded}/{result.num_claims} claims supported ({result.grounding_ratio:.0%})")
-        lines.append("\nUnsupported claims:")
-        for i, claim in enumerate(result.unsupported_claims, 1):
-            lines.append(f"  {i}. {claim}")
-    else:
-        lines.append(f"\n✓ All {result.num_claims} claims are grounded in source documents.")
-    
-    if verbose:
-        lines.append("\n\nAll claims:")
-        for v in result.verifications:
-            status = "✓" if v.is_grounded else "✗"
-            docs = f"(docs: {v.supporting_docs})" if v.supporting_docs else "(no support)"
-            lines.append(f"  {status} {v.claim[:80]}... {docs}")
-    
-    return "\n".join(lines)
-
-
-# Standalone test
 if __name__ == "__main__":
+    import asyncio
     import os
     os.environ["CUDA_VISIBLE_DEVICES"] = "0"
     
-    # Test with mock data
-    checker = HallucinationChecker()
+    from inference.generator import AsyncQwenGenerator, async_generator_context
     
-    # Mock contexts (would come from reranker in real usage)
-    mock_contexts = [
-        {
-            'text': "Matrix suppression is a phenomenon in mass spectrometry where components in the sample matrix interfere with the ionization process. This effect is particularly pronounced in electrospray ionization (ESI)."
-        },
-        {
-            'text': "Ion competition effects are a major source of matrix suppression in ESI-MS. When multiple species are present in the electrospray droplet, they compete for the limited charge available."
-        }
-    ]
+    async def test():
+        contexts = [
+            {"text": "Matrix suppression is a phenomenon in mass spectrometry where components interfere with ionization."},
+            {"text": "Ion competition effects are a major source of matrix suppression in ESI-MS."}
+        ]
+        
+        answer = (
+            "Matrix suppression is a phenomenon in mass spectrometry. "
+            "Ion competition is a major cause. "
+            "It was discovered in 1985 by Dr. Smith."  # hallucination
+        )
+        
+        async with async_generator_context(tensor_parallel_size=1, gpu_memory_utilization=0.9) as generator:
+            checker = HallucinationChecker(generator=generator, device="cpu")
+            result = await checker.check(answer, contexts)
+            print(result)
+            print(f"Claims: {result['num_claims']}")
+            print(f"Grounded: {result['num_grounded']}")
+            print(f"Ratio: {result['grounding_ratio']:.0%}")
+            print(f"Unsupported: {result['unsupported_claims']}")
+            
+            checker.cleanup()
     
-    # Mock answer
-    mock_answer = """Matrix suppression is a phenomenon in mass spectrometry where matrix components interfere with ionization. 
-    It is particularly common in ESI (electrospray ionization). 
-    Ion competition is a major cause of this effect.
-    Matrix suppression was first discovered in 1985 by Dr. Smith."""
-    
-    # Manual claim splitting for testing (without generator)
-    mock_claims = [
-        "Matrix suppression is a phenomenon in mass spectrometry where matrix components interfere with ionization.",
-        "Matrix suppression is particularly common in ESI (electrospray ionization).",
-        "Ion competition is a major cause of matrix suppression.",
-        "Matrix suppression was first discovered in 1985 by Dr. Smith."
-    ]
-    
-    # Test verification
-    documents = [ctx['text'] for ctx in mock_contexts]
-    verifications = checker.verify_claims(mock_claims, documents)
-    
-    print("\n" + "="*60)
-    print("HALLUCINATION CHECK TEST")
-    print("="*60)
-    
-    for v in verifications:
-        status = "GROUNDED" if v.is_grounded else "UNSUPPORTED"
-        print(f"\n[{status}] {v.claim}")
-        print(f"  Max score: {v.max_score:.4f}")
-        print(f"  Supporting docs: {v.supporting_docs}")
-    
-    # Summary
-    grounded = sum(1 for v in verifications if v.is_grounded)
-    print(f"\n{'='*60}")
-    print(f"Summary: {grounded}/{len(verifications)} claims grounded")
-    print("="*60)
-    
-    checker.cleanup()
+    asyncio.run(test())
