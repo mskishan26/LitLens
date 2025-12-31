@@ -1,31 +1,31 @@
 """
-RAG Chat Pipeline - Updated
-===========================
+RAG Chat Pipeline V2 - Concurrent Execution
+============================================
 
-4-Stage RAG Pipeline with:
-- Multi-device support (separate devices for embedding, reranker, generator)
-- Optional hallucination detection (toggle-able)
-- Request tracing with SQLite storage
-- Memory-safe lazy imports
+Key improvements over V1:
+1. Retrieval stages (1-3) separated from Generation (4)
+2. GPU semaphore for serialized generation
+3. Reranker auto-offloads to CPU after use
+4. Multiple queries can progress through retrieval while waiting for GPU
 
-Chainlit Integration:
-    The `enable_hallucination_check` parameter can be controlled via a Chainlit
-    toggle switch. See the example Chainlit integration at the bottom.
+Architecture:
+    Query A: [Retrieval] -> [Rerank] -> [===== GENERATING =====]
+    Query B: [Retrieval] -> [Rerank] -> [WAITING] -> [GENERATING]
+                                         ^
+                                         GPU semaphore
 """
 
 import asyncio
 import time
-import os
 import gc
-import sys
 from pathlib import Path
 from typing import List, Dict, Optional, Set, Any, AsyncGenerator, Tuple
+from dataclasses import dataclass
 
 from utils.logger import (
     get_logger, 
     set_request_context, 
     clear_request_context,
-    get_request_context
 )
 from utils.config_loader import load_config
 
@@ -43,38 +43,40 @@ def reranker_tracer(a: List[Dict]) -> Dict[str, Dict]:
     return tracer_dict
 
 
-class RAGPipeline:
+@dataclass
+class RetrievalResult:
+    """Container for retrieval stage outputs."""
+    reranked_results: List[Dict]
+    selected_papers: Set[str]
+    trace_id: Optional[str]
+    req_id: str
+    retrieval_duration_ms: float
+    
+    # For tracing
+    bm25_output: Optional[Any] = None
+    emb_paper_results: Optional[Any] = None
+    chunk_results: Optional[Any] = None
+    fusion_scores: Optional[Dict] = None
+
+
+class RAGPipelineV2:
     """
-    Orchestrates the 4-Stage RAG Pipeline with:
-    - Multi-device configuration
-    - Optional hallucination checking
-    - Request tracing
+    Concurrent RAG Pipeline with GPU-serialized generation.
     """
 
     def __init__(
         self,
         config_path: Optional[str] = None,
-        # Device configuration
         embedding_device: str = "cpu",
         reranker_device: str = "cuda",
         generator_device: str = "cuda",
         hallucination_device: str = "cpu",
-        # Feature flags
         enable_tracing: bool = True,
-        trace_db_path: str = "traces/request_traces.db"
+        trace_db_path: str = "traces/request_traces.db",
+        # Concurrency settings
+        max_concurrent_generation: int = 1,
+        reranker_auto_offload: bool = True,
     ):
-        """
-        Initialize the RAG pipeline.
-        
-        Args:
-            config_path: Path to configuration YAML file.
-            embedding_device: Device for embedding model ("cpu" or "cuda").
-            reranker_device: Device for reranker model ("cpu" or "cuda").
-            generator_device: Device for generator model (typically "cuda").
-            hallucination_device: Device for HHEM model ("cpu" recommended for 0.1B).
-            enable_tracing: Whether to enable request tracing.
-            trace_db_path: Path to SQLite database for traces.
-        """
         self.config = load_config(config_path)
         
         self.paths = self.config['paths']
@@ -87,41 +89,37 @@ class RAGPipeline:
         self.reranker_device = reranker_device
         self.generator_device = generator_device
         self.hallucination_device = hallucination_device
+        self.reranker_auto_offload = reranker_auto_offload
         
-        # Component instances (lazy loaded)
+        # Components (lazy loaded)
         self.bm25: Any = None
         self.embedding: Any = None
         self.reranker: Any = None
         self.generator: Any = None
         self.hallucination_checker: Any = None
+        self.tracer: Any = None
         
         # Tracing
         self.enable_tracing = enable_tracing
         self.trace_db_path = trace_db_path
-        self.tracer: Any = None
+        
+        # GPU SEMAPHORE - Key for concurrent execution
+        self._gpu_semaphore = asyncio.Semaphore(max_concurrent_generation)
+        self._generation_queue_depth = 0
+        self._queue_lock = asyncio.Lock()
 
     async def initialize(self):
-        """
-        Initialize all pipeline components.
+        """Initialize all pipeline components with lazy imports."""
+        logger.info("Initializing RAG Pipeline V2 (concurrent mode)...")
         
-        CRITICAL: All heavy imports happen here (lazy loading) to prevent
-        CUDA initialization before multiprocessing spawn is configured.
-        """
-        logger.info("Initializing RAG Pipeline components...")
-        logger.info(f"Device config: embedding={self.embedding_device}, "
-                   f"reranker={self.reranker_device}, generator={self.generator_device}, "
-                   f"hallucination={self.hallucination_device}")
-
-        # --- LAZY IMPORTS ---
         import torch 
         from inference.bm25_search import BM25Searcher
         from inference.embedding_search import EmbeddingSearch
-        from inference.reranker import Reranker
+        from inference.reranker import Reranker  # Use V2 reranker if available
         from inference.generator import AsyncQwenGenerator
         from hallucination_checker import HallucinationChecker
         from request_tracer import RequestTracer
         
-        # Validate CUDA availability
         cuda_available = torch.cuda.is_available()
         if not cuda_available:
             logger.warning("CUDA not available, forcing all devices to CPU")
@@ -130,52 +128,47 @@ class RAGPipeline:
             self.generator_device = "cpu"
             self.hallucination_device = "cpu"
 
-        # 1. Initialize Tracer (if enabled)
+        # 1. Tracer
         if self.enable_tracing:
             self.tracer = RequestTracer(db_path=self.trace_db_path)
-            logger.info("Request tracer initialized")
 
-        # 2. Load BM25 (CPU only - no device option)
+        # 2. BM25
         self.bm25 = BM25Searcher(artifacts_dir=self.paths['bm25_artifacts'])
         self.bm25.load_bm25_artifacts()
-        logger.info("BM25 searcher loaded")
         
-        # 3. Load Embedding Search
+        # 3. Embedding Search
         self.embedding = EmbeddingSearch(
             embedding_model_name=self.models['embedding'],
             device=self.embedding_device,
             truncate_dim=self.retrieval_conf.get('truncate_dim')
         )
         self.embedding.load(Path(self.paths['embeddings']))
-        logger.info(f"Embedding search loaded on {self.embedding_device}")
         
-        # 4. Load Reranker
+        # 4. Reranker (with auto-offload support)
         self.reranker = Reranker(
             model_name=self.models['reranker'],
             device=self.reranker_device,
             batch_size=4,
-            timeout_seconds=60
+            timeout_seconds=60,
+            auto_offload=self.reranker_auto_offload,  # NEW
         )
-        logger.info(f"Reranker loaded on {self.reranker_device}")
         
-        # 5. Load Generator
+        # 5. Generator
         self.generator = AsyncQwenGenerator(
             model_name=self.models['generator'],
             gpu_memory_utilization=0.4,
             tensor_parallel_size=1
         )
         await self.generator.initialize()
-        logger.info("Generator initialized")
         
-        # 6. Initialize Hallucination Checker (lazy - model loaded on first use)
+        # 6. Hallucination Checker
         self.hallucination_checker = HallucinationChecker(
             generator=self.generator,
             device=self.hallucination_device,
             threshold=self.config.get('hallucination', {}).get('threshold', 0.5)
         )
-        logger.info(f"Hallucination checker ready (device={self.hallucination_device})")
         
-        logger.info("Pipeline initialized successfully")
+        logger.info("Pipeline V2 initialized (concurrent mode enabled)")
 
     async def cleanup(self):
         """Free all resources."""
@@ -184,7 +177,6 @@ class RAGPipeline:
 
         logger.info("Cleaning up pipeline resources...")
         
-        # Cleanup components in reverse order
         if self.hallucination_checker:
             self.hallucination_checker.cleanup()
             self.hallucination_checker = None
@@ -204,188 +196,175 @@ class RAGPipeline:
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-            torch.cuda.synchronize()
 
-        if dist.is_initialized():
-            try:
-                dist.destroy_process_group()
-            except Exception as e:
-                logger.warning(f"Error destroying process group: {e}")
-
-        logger.info("Pipeline resources cleaned up")
-
-    async def answer_stream(
-        self, 
-        query: str, 
-        conversation_id: str = "default-session",
-        enable_hallucination_check: bool = False
-    ) -> AsyncGenerator[Dict[str, Any], None]:
+    # =========================================================================
+    # STAGE 1-3: RETRIEVAL (Can run concurrently for multiple queries)
+    # =========================================================================
+    
+    async def _run_retrieval_stages(
+        self,
+        query: str,
+        conversation_id: str,
+        req_id: str,
+    ) -> RetrievalResult:
         """
-        Process a query through the RAG pipeline with streaming output.
+        Run stages 1-3 (BM25, Embedding, Reranking).
         
-        Args:
-            query: The user's question.
-            conversation_id: Chat session identifier.
-            enable_hallucination_check: Whether to run hallucination detection.
-                Can be toggled per-request (e.g., via Chainlit switch).
-        
-        Yields:
-            Dicts with types: "status", "context", "token", "hallucination", "done", "error"
+        This method does NOT hold the GPU semaphore, allowing multiple
+        queries to complete retrieval while waiting for generation.
         """
         import torch
-        
         start_time = time.perf_counter()
         trace_id = None
         
-        # Set up request context
-        req_id = set_request_context(conversation_id=conversation_id)
+        # Start tracing
+        if self.tracer:
+            trace_id = self.tracer.start_trace(
+                query=query,
+                conversation_id=conversation_id,
+                req_id=req_id
+            )
         
-        try:
-            # Start tracing
-            if self.tracer:
-                trace_id = self.tracer.start_trace(
-                    query=query,
-                    conversation_id=conversation_id,
-                    req_id=req_id
-                )
-            
-            # =========================================================
-            # STAGE 1: Hybrid Retrieval (BM25 + Embedding for Papers)
-            # =========================================================
-            logger.info("Stage 1: Hybrid Retrieval")
-            stage_start = time.perf_counter()
-            
-            # BM25 Search
-            bm25_start = time.perf_counter()
-            bm25_search_output = self.bm25.search(
-                query, 
-                k=self.retrieval_conf['k_papers'] * 2
+        # ===== STAGE 1: Hybrid Retrieval =====
+        logger.info(f"[{req_id[:8]}] Stage 1: Hybrid Retrieval")
+        
+        # BM25
+        bm25_start = time.perf_counter()
+        bm25_output = self.bm25.search(
+            query, 
+            k=self.retrieval_conf['k_papers'] * 2
+        )
+        bm25_results, bm25_scores = map(list, zip(*bm25_output))
+        bm25_duration = (time.perf_counter() - bm25_start) * 1000
+        
+        if self.tracer and trace_id:
+            self.tracer.capture_bm25(trace_id, bm25_output, bm25_duration)
+        
+        # Embedding for Papers
+        emb_start = time.perf_counter()
+        emb_paper_results = self.embedding.search(
+            query, 
+            collection_num=1, 
+            k=self.retrieval_conf['k_papers'] * 2
+        )
+        emb_duration = (time.perf_counter() - emb_start) * 1000
+        
+        emb_tracer = [[item[1].get('chroma_id', 'N/A'), round(item[0], 4)] 
+                      for item in emb_paper_results]
+        
+        if self.tracer and trace_id:
+            self.tracer.capture_embedding_paper(trace_id, emb_tracer, emb_duration)
+        
+        # Hybrid Fusion
+        selected_papers, fusion_scores = self._hybrid_fusion(
+            bm25_results, emb_paper_results, 
+            k=self.retrieval_conf['k_papers'],
+            return_scores=True
+        )
+        
+        if self.tracer and trace_id:
+            self.tracer.capture_hybrid_fusion(trace_id, list(selected_papers), fusion_scores)
+        
+        # ===== STAGE 2: Chunk Retrieval =====
+        logger.info(f"[{req_id[:8]}] Stage 2: Chunk Retrieval")
+        
+        chunk_start = time.perf_counter()
+        chunk_results = self.embedding.search(
+            query,
+            collection_num=2,
+            k=self.retrieval_conf['m_chunks'],
+            file_path_filter=selected_papers
+        )
+        chunk_duration = (time.perf_counter() - chunk_start) * 1000
+        
+        chunk_tracer = [[item[1].get('chroma_id', 'N/A'), round(item[0], 4)] 
+                        for item in chunk_results]
+        
+        if self.tracer and trace_id:
+            self.tracer.capture_embedding_chunk(trace_id, chunk_tracer, chunk_duration)
+        
+        # ===== STAGE 3: Reranking =====
+        logger.info(f"[{req_id[:8]}] Stage 3: Reranking")
+        
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
+        rerank_start = time.perf_counter()
+        reranked_results = self.reranker.rerank_with_details(
+            query,
+            candidates=chunk_results,
+            top_k=self.retrieval_conf['n_reranked']
+        )
+        rerank_duration = (time.perf_counter() - rerank_start) * 1000
+        
+        # NOTE: Reranker auto-offloads to CPU here (if enabled)
+        # This frees GPU memory for the generator
+        
+        if self.tracer and trace_id:
+            self.tracer.capture_reranker(
+                trace_id, 
+                reranker_tracer(reranked_results), 
+                rerank_duration
             )
-            bm25_results, bm25_scores = map(list, zip(*bm25_search_output))
-            bm25_duration = (time.perf_counter() - bm25_start) * 1000
-            
-            # Capture BM25 trace
-            if self.tracer and trace_id:
-                self.tracer.capture_bm25(trace_id, bm25_search_output, bm25_duration)
-            
-            # Embedding Search for Papers
-            emb_start = time.perf_counter()
-            emb_paper_results = self.embedding.search(
-                query, 
-                collection_num=1, 
-                k=self.retrieval_conf['k_papers'] * 2
-            )
-            emb_duration = (time.perf_counter() - emb_start) * 1000
-            
-            # Tracer format for embedding results
-            emb_paper_results_tracer = [
-                [item[1].get('chroma_id', 'N/A'), round(item[0], 4)] 
-                for item in emb_paper_results
-            ]
-            
-            if self.tracer and trace_id:
-                self.tracer.capture_embedding_paper(
-                    trace_id, 
-                    emb_paper_results_tracer, 
-                    emb_duration
-                )
-            
-            # Hybrid Fusion
-            selected_papers, fusion_scores = self._hybrid_fusion(
-                bm25_results, 
-                emb_paper_results, 
-                k=self.retrieval_conf['k_papers'],
-                return_scores=True
-            )
-            
-            if self.tracer and trace_id:
-                self.tracer.capture_hybrid_fusion(
-                    trace_id, 
-                    list(selected_papers), 
-                    fusion_scores
-                )
-            
-            yield {
-                "type": "status", 
-                "stage": "stage_1_complete", 
-                "papers_found": len(selected_papers)
-            }
+        
+        retrieval_duration = (time.perf_counter() - start_time) * 1000
+        logger.info(f"[{req_id[:8]}] Retrieval complete in {retrieval_duration:.0f}ms")
+        
+        return RetrievalResult(
+            reranked_results=reranked_results,
+            selected_papers=selected_papers,
+            trace_id=trace_id,
+            req_id=req_id,
+            retrieval_duration_ms=retrieval_duration,
+            bm25_output=bm25_output,
+            emb_paper_results=emb_paper_results,
+            chunk_results=chunk_results,
+            fusion_scores=fusion_scores,
+        )
 
-            # =========================================================
-            # STAGE 2: Chunk Retrieval
-            # =========================================================
-            logger.info("Stage 2: Chunk Retrieval")
-            chunk_start = time.perf_counter()
+    # =========================================================================
+    # STAGE 4: GENERATION (GPU-serialized)
+    # =========================================================================
+    
+    async def _run_generation(
+        self,
+        query: str,
+        retrieval_result: RetrievalResult,
+        enable_hallucination_check: bool = False,
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """
+        Run generation stage under GPU semaphore.
+        
+        This ensures only one query is generating at a time,
+        while others can complete retrieval stages.
+        """
+        trace_id = retrieval_result.trace_id
+        req_id = retrieval_result.req_id
+        reranked_results = retrieval_result.reranked_results
+        
+        # Track queue depth
+        async with self._queue_lock:
+            self._generation_queue_depth += 1
+            queue_pos = self._generation_queue_depth
+        
+        if queue_pos > 1:
+            logger.info(f"[{req_id[:8]}] Waiting for GPU (position {queue_pos} in queue)")
+            yield {"type": "status", "stage": "waiting_for_gpu", "queue_position": queue_pos}
+        
+        wait_start = time.perf_counter()
+        
+        # ===== ACQUIRE GPU SEMAPHORE =====
+        async with self._gpu_semaphore:
+            wait_time = (time.perf_counter() - wait_start) * 1000
             
-            chunk_results = self.embedding.search(
-                query,
-                collection_num=2,
-                k=self.retrieval_conf['m_chunks'],
-                file_path_filter=selected_papers
-            )
-            chunk_duration = (time.perf_counter() - chunk_start) * 1000
+            async with self._queue_lock:
+                self._generation_queue_depth -= 1
             
-            emb_chunk_results_tracer = [
-                [item[1].get('chroma_id', 'N/A'), round(item[0], 4)] 
-                for item in chunk_results
-            ]
+            if wait_time > 100:
+                logger.info(f"[{req_id[:8]}] GPU acquired after {wait_time:.0f}ms wait")
             
-            if self.tracer and trace_id:
-                self.tracer.capture_embedding_chunk(
-                    trace_id, 
-                    emb_chunk_results_tracer, 
-                    chunk_duration
-                )
-            
-            yield {
-                "type": "status", 
-                "stage": "stage_2_complete", 
-                "chunks_found": len(chunk_results)
-            }
-
-            # =========================================================
-            # STAGE 3: Reranking
-            # =========================================================
-            logger.info("Stage 3: Reranking")
-            rerank_start = time.perf_counter()
-            
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
-            reranked_results = self.reranker.rerank_with_details(
-                query,
-                candidates=chunk_results,
-                top_k=self.retrieval_conf['n_reranked']
-            )
-            rerank_duration = (time.perf_counter() - rerank_start) * 1000
-            
-            # Tracer format for reranker
-            reranker_trace_data = reranker_tracer(reranked_results)
-            
-            if self.tracer and trace_id:
-                self.tracer.capture_reranker(
-                    trace_id, 
-                    reranker_trace_data, 
-                    rerank_duration
-                )
-            
-            # Yield context for display
-            yield {
-                "type": "context", 
-                "data": [
-                    {
-                        "text": r['text'], 
-                        "metadata": r['metadata'], 
-                        "score": r['rerank_score']
-                    } 
-                    for r in reranked_results
-                ]
-            }
-
-            # =========================================================
-            # STAGE 4: Generation
-            # =========================================================
-            logger.info("Stage 4: Generation")
+            # ===== STAGE 4: Generation =====
+            logger.info(f"[{req_id[:8]}] Stage 4: Generation")
             gen_start = time.perf_counter()
             
             accumulated_text = ""
@@ -414,17 +393,12 @@ class RAGPipeline:
                     completion_tokens=token_count,
                     ttft_ms=ttft
                 )
-
-            # =========================================================
-            # STAGE 5: Hallucination Check (Optional)
-            # =========================================================
-            hallucination_result = None
             
+            # ===== STAGE 5: Hallucination Check (Optional) =====
             if enable_hallucination_check and self.hallucination_checker:
-                logger.info("Stage 5: Hallucination Check")
+                logger.info(f"[{req_id[:8]}] Stage 5: Hallucination Check")
                 hal_start = time.perf_counter()
                 
-                # Prepare contexts for hallucination checker
                 hal_contexts = [
                     {"text": r['text'], "metadata": r['metadata']} 
                     for r in reranked_results
@@ -445,7 +419,6 @@ class RAGPipeline:
                         duration_ms=hal_duration
                     )
                 
-                # Yield hallucination results
                 yield {
                     "type": "hallucination",
                     "grounding_ratio": hallucination_result['grounding_ratio'],
@@ -454,31 +427,78 @@ class RAGPipeline:
                     "unsupported_claims": hallucination_result['unsupported_claims'],
                     "verifications": hallucination_result['verifications']
                 }
-                
-                logger.info(
-                    f"Hallucination check: {hallucination_result['grounding_ratio']:.0%} grounded, "
-                    f"{len(hallucination_result['unsupported_claims'])} unsupported claims"
-                )
 
+    # =========================================================================
+    # MAIN ENTRY POINT
+    # =========================================================================
+    
+    async def answer_stream(
+        self, 
+        query: str, 
+        conversation_id: str = "default-session",
+        enable_hallucination_check: bool = False
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """
+        Process a query through the concurrent RAG pipeline.
+        
+        Flow:
+        1. Retrieval stages run immediately (no GPU lock)
+        2. Generation acquires GPU semaphore (queued if busy)
+        3. Other queries can complete retrieval while waiting
+        """
+        start_time = time.perf_counter()
+        req_id = set_request_context(conversation_id=conversation_id)
+        
+        try:
+            # ===== STAGES 1-3: Retrieval (concurrent) =====
+            retrieval_result = await self._run_retrieval_stages(
+                query=query,
+                conversation_id=conversation_id,
+                req_id=req_id,
+            )
+            
+            yield {
+                "type": "status", 
+                "stage": "retrieval_complete",
+                "papers_found": len(retrieval_result.selected_papers),
+                "chunks_reranked": len(retrieval_result.reranked_results),
+            }
+            
+            yield {
+                "type": "context", 
+                "data": [
+                    {
+                        "text": r['text'], 
+                        "metadata": r['metadata'], 
+                        "score": r['rerank_score']
+                    } 
+                    for r in retrieval_result.reranked_results
+                ]
+            }
+            
+            # ===== STAGE 4-5: Generation (GPU-serialized) =====
+            async for update in self._run_generation(
+                query=query,
+                retrieval_result=retrieval_result,
+                enable_hallucination_check=enable_hallucination_check,
+            ):
+                yield update
+            
             # Finish tracing
-            if self.tracer and trace_id:
-                self.tracer.finish_trace(trace_id, success=True)
+            if self.tracer and retrieval_result.trace_id:
+                self.tracer.finish_trace(retrieval_result.trace_id, success=True)
             
             total_duration = (time.perf_counter() - start_time) * 1000
-            logger.info(f"Request completed in {total_duration:.0f}ms")
+            logger.info(f"[{req_id[:8]}] Request completed in {total_duration:.0f}ms")
             
             yield {
                 "type": "done", 
-                "trace_id": trace_id,
+                "trace_id": retrieval_result.trace_id,
                 "total_duration_ms": total_duration
             }
 
         except Exception as e:
             logger.error(f"Pipeline Error: {e}", exc_info=True)
-            
-            if self.tracer and trace_id:
-                self.tracer.finish_trace(trace_id, success=False, error_message=str(e))
-            
             yield {"type": "error", "message": str(e)}
         
         finally:
@@ -491,18 +511,7 @@ class RAGPipeline:
         k: int,
         return_scores: bool = False
     ) -> Tuple[Set[str], Dict[str, float]] | Set[str]:
-        """
-        Fuse BM25 and embedding results using weighted rank fusion.
-        
-        Args:
-            bm25_list: List of file paths from BM25.
-            emb_list: List of (distance, metadata, text) from embedding search.
-            k: Number of papers to select.
-            return_scores: Whether to return fusion scores for tracing.
-        
-        Returns:
-            Set of selected file paths, optionally with fusion scores.
-        """
+        """Fuse BM25 and embedding results using weighted rank fusion."""
         scores = {}
         bm25_w = self.retrieval_conf['bm25_weight']
         emb_w = self.retrieval_conf['embedding_weight']
@@ -524,176 +533,90 @@ class RAGPipeline:
             return selected, scores
         return selected
 
+    @property
+    def generation_queue_depth(self) -> int:
+        """Number of queries waiting for GPU."""
+        return self._generation_queue_depth
 
-# ==============================================================================
-# CHAINLIT INTEGRATION EXAMPLE
-# ==============================================================================
-"""
-Example Chainlit app with hallucination toggle:
 
-```python
-import chainlit as cl
-from chat_pipeline import RAGPipeline
+# =============================================================================
+# TEST: Concurrent Query Simulation
+# =============================================================================
 
-pipeline = None
-
-@cl.on_chat_start
-async def start():
-    global pipeline
+async def test_concurrent_execution():
+    """
+    Test that demonstrates concurrent query handling.
     
-    # Initialize pipeline once
-    pipeline = RAGPipeline(
-        embedding_device="cpu",
-        reranker_device="cuda",
-        generator_device="cuda",
-        hallucination_device="cpu"
-    )
-    await pipeline.initialize()
+    Without proper concurrency:
+        Query A (3s) + Query B (2s) = 5s total
     
-    # Create hallucination toggle switch
-    settings = await cl.ChatSettings(
-        [
-            cl.input_widget.Switch(
-                id="hallucination_check",
-                label="Enable Hallucination Detection",
-                initial=False,
-                description="Verify claims against source documents"
-            )
-        ]
-    ).send()
+    With concurrent retrieval:
+        Query A: [1s retrieval] [=== 2s generation ===]
+        Query B:     [0.5s retrieval] [wait] [=== 1.5s generation ===]
+        Total: ~3.5s (overlapped retrieval)
+    """
+    print("\n" + "="*70)
+    print("CONCURRENT EXECUTION TEST")
+    print("="*70)
     
-    cl.user_session.set("hallucination_check", False)
-
-@cl.on_settings_update
-async def settings_update(settings):
-    cl.user_session.set("hallucination_check", settings.get("hallucination_check", False))
-
-@cl.on_message
-async def main(message: cl.Message):
-    # Get toggle state
-    enable_hallucination = cl.user_session.get("hallucination_check", False)
-    conversation_id = cl.user_session.get("conversation_id", "default")
-    
-    # Create streaming message
-    msg = cl.Message(content="")
-    await msg.send()
-    
-    # Process through pipeline
-    async for update in pipeline.answer_stream(
-        query=message.content,
-        conversation_id=conversation_id,
-        enable_hallucination_check=enable_hallucination
-    ):
-        if update["type"] == "token":
-            await msg.stream_token(update["content"])
+    # Mock pipeline that simulates timing
+    class MockPipeline:
+        def __init__(self):
+            self._gpu_semaphore = asyncio.Semaphore(1)
+            self._queue_depth = 0
         
-        elif update["type"] == "hallucination":
-            # Add hallucination info as a step
-            async with cl.Step(name="Hallucination Check") as step:
-                ratio = update["grounding_ratio"]
-                unsupported = update["unsupported_claims"]
+        async def process_query(self, name: str, retrieval_time: float, gen_time: float):
+            # Retrieval (no lock)
+            print(f"[{name}] Starting retrieval...")
+            await asyncio.sleep(retrieval_time)
+            print(f"[{name}] Retrieval complete, waiting for GPU...")
+            
+            # Generation (locked)
+            wait_start = time.perf_counter()
+            async with self._gpu_semaphore:
+                wait_time = (time.perf_counter() - wait_start) * 1000
+                if wait_time > 10:
+                    print(f"[{name}] GPU acquired after {wait_time:.0f}ms wait")
+                else:
+                    print(f"[{name}] GPU acquired immediately")
                 
-                step.output = f"**Grounding: {ratio:.0%}** ({update['num_grounded']}/{update['num_claims']} claims verified)\\n\\n"
-                
-                if unsupported:
-                    step.output += "**Unverified Claims:**\\n"
-                    for claim in unsupported:
-                        step.output += f"- {claim}\\n"
-        
-        elif update["type"] == "context":
-            # Optionally show sources
-            sources = update["data"][:3]
-            elements = [
-                cl.Text(
-                    name=f"Source {i+1}",
-                    content=src["text"][:500],
-                    display="side"
-                )
-                for i, src in enumerate(sources)
-            ]
-            msg.elements = elements
-        
-        elif update["type"] == "error":
-            msg.content = f"Error: {update['message']}"
+                print(f"[{name}] === GENERATING ===")
+                await asyncio.sleep(gen_time)
+                print(f"[{name}] === DONE ===")
     
-    await msg.update()
-```
-"""
+    pipeline = MockPipeline()
+    
+    start = time.perf_counter()
+    
+    # Launch queries with slight offset
+    async def run():
+        task_a = asyncio.create_task(pipeline.process_query("A", 1.0, 2.0))
+        await asyncio.sleep(0.3)  # Query B arrives 0.3s later
+        task_b = asyncio.create_task(pipeline.process_query("B", 0.5, 1.5))
+        await asyncio.gather(task_a, task_b)
+    
+    await run()
+    
+    total = time.perf_counter() - start
+    sequential = 1.0 + 2.0 + 0.5 + 1.5  # 5s
+    
+    print(f"\n{'='*70}")
+    print(f"Total time: {total:.2f}s")
+    print(f"Sequential would be: {sequential:.1f}s")
+    print(f"Time saved: {sequential - total:.2f}s ({(1 - total/sequential)*100:.0f}% faster)")
+    print(f"{'='*70}\n")
 
 
-# ==============================================================================
-# MAIN EXECUTION
-# ==============================================================================
 if __name__ == "__main__":
-    # 1. SETUP MULTIPROCESSING FIRST (Before ANY logic runs)
+    import os
     import multiprocessing as mp
+    
     try:
         mp.set_start_method('spawn', force=True)
     except RuntimeError:
-        pass 
-
-    # 2. Set environment variables
+        pass
+    
     os.environ['PYTORCH_ALLOC_CONF'] = 'expandable_segments:True'
-
-    # 3. Run Pipeline
-    async def main():
-        # Configure devices: embedding and hallucination on CPU, rest on GPU
-        pipeline = RAGPipeline(
-            embedding_device="cpu",
-            reranker_device="cuda",
-            generator_device="cuda",
-            hallucination_device="cpu",
-            enable_tracing=True,
-            trace_db_path="traces/request_traces.db"
-        )
-        
-        try:
-            await pipeline.initialize()
-            
-            query = "What is the impact of matrix effects?"
-            print(f"Query: {query}\n")
-            print("-" * 50)
-            
-            # Test with hallucination check enabled
-            async for update in pipeline.answer_stream(
-                query=query,
-                conversation_id="test-session",
-                enable_hallucination_check=True  # Toggle this!
-            ):
-                if update['type'] == 'token':
-                    print(update['content'], end="", flush=True)
-                
-                elif update['type'] == 'status':
-                    print(f"\n[{update['stage']}]", flush=True)
-                
-                elif update['type'] == 'hallucination':
-                    print(f"\n\n{'='*50}")
-                    print("HALLUCINATION CHECK RESULTS")
-                    print(f"{'='*50}")
-                    print(f"Grounding Ratio: {update['grounding_ratio']:.0%}")
-                    print(f"Claims: {update['num_grounded']}/{update['num_claims']} verified")
-                    
-                    if update['unsupported_claims']:
-                        print(f"\nUnsupported Claims:")
-                        for claim in update['unsupported_claims']:
-                            print(f"  ⚠️  {claim}")
-                    print(f"{'='*50}\n")
-                
-                elif update['type'] == 'error':
-                    print(f"\nERROR: {update['message']}")
-                
-                elif update['type'] == 'done':
-                    print(f"\n\n[Completed in {update['total_duration_ms']:.0f}ms]")
-                    print(f"[Trace ID: {update['trace_id']}]")
-                    
-        except Exception as e:
-            print(f"\nCRITICAL FAILURE: {e}")
-            import traceback
-            traceback.print_exc()
-        finally:
-            await pipeline.cleanup()
-
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("\nInterrupted by user")
+    
+    # Run concurrent test
+    asyncio.run(test_concurrent_execution())

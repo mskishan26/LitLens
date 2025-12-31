@@ -1,14 +1,19 @@
 """
 Jina-compatible reranker for Stage 3 of RAG pipeline.
+V3: Merged version with:
+    - Timeout fallback (restored from v1)
+    - Internal thread safety 
+    - GPU memory management (cache clearing, not CPU offload)
+    - Optional AsyncReranker wrapper for async pipelines
 """
 
 import torch
 from transformers import AutoModel
 from typing import List, Tuple, Dict, Optional, Any
 import time
+import threading
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 
-# Import your custom logger utilities
 from utils.logger import (
     get_logger, 
     log_stage_start, 
@@ -19,9 +24,13 @@ from utils.config_loader import load_config
 
 logger = get_logger(__name__)
 
+
 class Reranker:
     """
-    Jina-based cross-encoder reranker for Stage 3 of RAG pipeline.
+    Jina-based cross-encoder reranker with:
+    - Timeout protection for hung inference
+    - Thread-safe execution
+    - GPU memory management (clears compute overhead, keeps model loaded)
     """
     
     def __init__(
@@ -32,16 +41,21 @@ class Reranker:
         batch_size: int = 8,
         max_length: int = 1024,
         timeout_seconds: int = 30,
-        max_workers: int = 1
+        max_workers: int = 1,
+        auto_clear_cache: bool = True,  # Clear GPU cache after each rerank
     ):
         self.config = load_config(config_path) if config_path else {}
-        # Default to config, fallback to arg, fallback to hardcoded
         model_name = model_name or self.config.get('models', {}).get('reranker', 'jinaai/jina-reranker-v3')
         
         self.device = device
         self.batch_size = batch_size
         self.max_length = max_length
         self.timeout_seconds = timeout_seconds
+        self.auto_clear_cache = auto_clear_cache
+        
+        # Thread safety
+        self._lock = threading.Lock()
+        self._executor = ThreadPoolExecutor(max_workers=max_workers)
         
         logger.info(f"Loading Jina reranker model '{model_name}' on {device}")
         
@@ -55,16 +69,71 @@ class Reranker:
             self.model = self.model.to(device)
         
         self.model.eval()
-        self._executor = ThreadPoolExecutor(max_workers=max_workers)
         
         logger.info("Jina reranker loaded successfully", extra={
             "device": device,
-            "timeout": timeout_seconds
+            "timeout_seconds": timeout_seconds,
+            "auto_clear_cache": auto_clear_cache,
         })
     
     def __del__(self):
         if hasattr(self, '_executor'):
             self._executor.shutdown(wait=False)
+    
+    # =========================================================================
+    # GPU MEMORY MANAGEMENT
+    # =========================================================================
+    
+    def clear_compute_cache(self) -> None:
+        """
+        Clear GPU activation/compute memory without moving model weights.
+        
+        Safe to call even when vLLM is running — only frees unreferenced memory.
+        vLLM's KV cache and weights are held in live tensors, so untouched.
+        """
+        if self.device == 'cuda':
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            logger.debug("Cleared GPU compute cache")
+    
+    def get_model_memory_mb(self) -> float:
+        """Approximate GPU memory used by model weights (not compute)."""
+        if self.device != 'cuda':
+            return 0.0
+        params = sum(p.numel() for p in self.model.parameters())
+        # float16 = 2 bytes per param
+        return (params * 2) / (1024 * 1024)
+    
+    # =========================================================================
+    # CORE RERANKING (with timeout protection)
+    # =========================================================================
+    
+    def _rerank_batch_internal(
+        self,
+        query: str,
+        texts: List[str],
+        batch_size: int,
+    ) -> Dict[int, float]:
+        """
+        Internal batched reranking. Runs inside executor for timeout protection.
+        Returns: {global_index: score}
+        """
+        all_scores = {}
+        
+        for start_idx in range(0, len(texts), batch_size):
+            batch_texts = texts[start_idx : start_idx + batch_size]
+            
+            batch_results = self.model.rerank(
+                query,
+                batch_texts,
+                top_n=None
+            )
+            
+            for r in batch_results:
+                global_idx = start_idx + r["index"]
+                all_scores[global_idx] = float(r["relevance_score"])
+        
+        return all_scores
     
     def rerank(
         self,
@@ -75,16 +144,16 @@ class Reranker:
         truncate_texts: bool = False,
         max_candidates: int = 50,
         batch_size: int = 5,
-        max_context_tokens: int = 2048,  # safety cap
+        max_context_tokens: int = 2048,
     ) -> Tuple[List[Tuple[float, Dict, str]], Dict[str, Any]]:
         """
-        Memory-safe batched reranking using Jina cross-encoder.
-
+        Memory-safe batched reranking with timeout protection.
+        
         Strategy:
         - Cap candidates
-        - Batch rerank (query + N docs at a time)
-        - Merge scores
-        - Global sort
+        - Run batched rerank with timeout
+        - Clear compute cache after (keeps model loaded)
+        - Fallback to Stage 2 scores on timeout/error
         """
         start_time = time.perf_counter()
 
@@ -100,12 +169,10 @@ class Reranker:
         if not valid_candidates:
             return [], {"method": "no_valid_text", "success": False}
 
-        # Hard cap (important for latency + stability)
         valid_candidates = valid_candidates[:max_candidates]
-
         texts = [t for _, _, t in valid_candidates]
 
-        # 2. Token safety (approximate)
+        # 2. Token safety (approximate truncation)
         def approx_tokens(s: str) -> int:
             return len(s) // 4
 
@@ -117,44 +184,58 @@ class Reranker:
                 else:
                     truncated_texts.append(t)
         else:
-            truncated_texts=texts
+            truncated_texts = texts
 
-        # 3. Batched reranking
+        # 3. Run reranking with timeout protection
         method = "jina_rerank_batched"
-        all_scores = {}  # global_index -> score
+        all_scores = {}
+        timed_out = False
+        error_msg = None
 
         try:
-            for start_idx in range(0, len(truncated_texts), batch_size):
-                batch_texts = truncated_texts[start_idx : start_idx + batch_size]
-
-                # IMPORTANT: model.rerank expects a list of documents
-                batch_results = self.model.rerank(
+            with self._lock:
+                future = self._executor.submit(
+                    self._rerank_batch_internal,
                     query,
-                    batch_texts,
-                    top_n=None
+                    truncated_texts,
+                    batch_size,
                 )
+                all_scores = future.result(timeout=self.timeout_seconds)
 
-                # Map batch-local indices → global indices
-                for r in batch_results:
-                    global_idx = start_idx + r["index"]
-                    all_scores[global_idx] = float(r["relevance_score"])
+        except FuturesTimeoutError:
+            timed_out = True
+            error_msg = f"Reranking timed out after {self.timeout_seconds}s"
+            logger.warning(error_msg, extra={
+                "candidates": len(valid_candidates),
+                "timeout": self.timeout_seconds,
+            })
+            method = "fallback_timeout"
 
         except Exception as e:
+            error_msg = str(e)
             logger.error(
                 "Batched reranking failed, falling back to Stage 2 scores",
                 exc_info=True,
-                extra={"error": str(e)}
+                extra={"error": error_msg}
             )
+            method = "fallback_error"
 
-            # Fallback: return Stage 2 ordering
+        finally:
+            # 4. Clear compute cache (keeps model loaded, frees activations)
+            if self.auto_clear_cache:
+                self.clear_compute_cache()
+
+        # 5. Handle fallback case
+        if timed_out or error_msg:
             return valid_candidates[:top_k], {
-                "method": "fallback_error",
+                "method": method,
                 "success": False,
                 "candidates_processed": len(valid_candidates),
-                "error": str(e),
+                "error": error_msg,
+                "timed_out": timed_out,
             }
 
-        # 4. Merge + global sort
+        # 6. Merge + global sort
         reranked = []
         for idx, (_, meta, text) in enumerate(valid_candidates):
             score = all_scores.get(idx, 0.0)
@@ -180,25 +261,20 @@ class Reranker:
         top_k: int = 5
     ) -> List[Dict]:
         """
-        Wrapper that handles logging, metrics, and detailed rank comparison.
+        Wrapper with logging, metrics, and detailed rank comparison.
         """
         start_time = time.perf_counter()
         
-        # LOG START
         log_stage_start(logger, "reranker", top_k=top_k, input_count=len(candidates))
 
-        # 1. OPTIMIZATION: Build O(1) lookup map for original ranks
-        # UPDATED: Using 'chroma_id' instead of id(meta)
+        # Build O(1) lookup map for original ranks
         original_rank_map = {}
         for idx, (dist, meta, _) in enumerate(candidates):
-            # We use .get() to be safe, assuming 'chroma_id' is a string or number
             c_id = meta.get('chroma_id')
-            
-            # Only map if the ID exists
             if c_id is not None:
                 original_rank_map[c_id] = (idx + 1, dist)
 
-        # 2. Call Core Rerank
+        # Core rerank
         reranked_results, run_info = self.rerank(
             query, 
             candidates, 
@@ -206,23 +282,18 @@ class Reranker:
             return_scores=True
         )
 
-        # 3. Build Detailed Response
+        # Build detailed response
         detailed_results = []
         
         for rank_idx, (score, meta, text) in enumerate(reranked_results):
             current_rank = rank_idx + 1
-            
-            # Retrieve the specific ID from this result's metadata
             c_id = meta.get('chroma_id')
-            
-            # O(1) Lookup using the ID
             orig_info = original_rank_map.get(c_id)
             
             if orig_info:
                 orig_rank, orig_dist = orig_info
-                rank_change = orig_rank - current_rank # Positive = Improved
+                rank_change = orig_rank - current_rank
             else:
-                # Occurs if chroma_id was missing or candidates list was mutated externally
                 orig_rank, orig_dist, rank_change = (None, None, 0)
 
             detailed_results.append({
@@ -235,10 +306,7 @@ class Reranker:
                 'text': text
             })
 
-        # 4. LOG METRICS (Compatible with logger.py)
         duration = (time.perf_counter() - start_time) * 1000
-        
-        # Determine top score safely
         top_score = detailed_results[0]['rerank_score'] if detailed_results else 0.0
         
         log_retrieval_metrics(
@@ -254,3 +322,61 @@ class Reranker:
         )
 
         return detailed_results
+
+
+# =============================================================================
+# ASYNC WRAPPER (Optional, for asyncio pipelines)
+# =============================================================================
+
+class AsyncReranker:
+    """
+    Async wrapper for use in asyncio pipelines.
+    
+    Delegates all logic to the core Reranker — this is just an async interface.
+    Timeout and memory management are handled by the underlying Reranker.
+    """
+    
+    def __init__(self, reranker: Reranker):
+        self.reranker = reranker
+        self._executor = ThreadPoolExecutor(max_workers=1)
+    
+    def __del__(self):
+        if hasattr(self, '_executor'):
+            self._executor.shutdown(wait=False)
+    
+    async def rerank(
+        self,
+        query: str,
+        candidates: List[Tuple[float, Dict, str]],
+        top_k: int = 5,
+        **kwargs
+    ) -> Tuple[List[Tuple[float, Dict, str]], Dict[str, Any]]:
+        """Async version of rerank."""
+        import asyncio
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            self._executor,
+            lambda: self.reranker.rerank(query, candidates, top_k, **kwargs)
+        )
+    
+    async def rerank_with_details(
+        self,
+        query: str,
+        candidates: List[Tuple[float, Dict, str]],
+        top_k: int = 5
+    ) -> List[Dict]:
+        """Async version of rerank_with_details."""
+        import asyncio
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            self._executor,
+            lambda: self.reranker.rerank_with_details(query, candidates, top_k)
+        )
+    
+    def clear_compute_cache(self) -> None:
+        """Proxy to underlying reranker."""
+        self.reranker.clear_compute_cache()
+    
+    @property
+    def device(self) -> str:
+        return self.reranker.device
