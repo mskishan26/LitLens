@@ -8,8 +8,9 @@ source /scratch/sathishbabu.ki/capstone_llm/bin/activate
 
 # Install CUDA 12.1 packages blazingly fast
 uv pip install vllm --torch-backend=cu128
-uv pip install sentence-transformers chromadb nltk setuptools rank-bm25 accelerate autoawq
+uv pip install sentence-transformers chromadb nltk setuptools rank-bm25 accelerate modal
 # !!!!! it feels like im missing mentioning a very important library here !!!!
+!!! WE DONT NEED MINICHECK ANYMORE BUT JUST LEAVING IT HERE
 uv pip install "minicheck @ git+https://github.com/Liyan06/MiniCheck.git@main"
 
 
