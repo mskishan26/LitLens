@@ -66,7 +66,7 @@ class RAGPipelineV2:
         trace_db_path: str = "traces/request_traces.db",
         # Concurrency settings
         max_concurrent_generation: int = 1,
-        reranker_auto_offload: bool = True,
+        reranker_auto_clear_cache: bool = True,
     ):
         self.config = load_config(config_path)
         
@@ -81,7 +81,7 @@ class RAGPipelineV2:
         self.reranker_device = self.devices['reranker_device']
         self.generator_device = self.devices['generator_device']
         self.hallucination_device = self.devices['hallucination_device']
-        self.reranker_auto_offload = reranker_auto_offload
+        self.reranker_auto_clear_cache = reranker_auto_clear_cache
         
         # Components (lazy loaded)
         self.bm25: Any = None
@@ -109,8 +109,8 @@ class RAGPipelineV2:
         from inference.embedding_search import EmbeddingSearch
         from inference.reranker import Reranker  # Use V2 reranker if available
         from inference.generator import AsyncQwenGenerator
-        from hallucination_checker import HallucinationChecker
-        from request_tracer import RequestTracer
+        from inference.hallucination_checker import HallucinationChecker
+        from utils.request_tracer import RequestTracer
         
         cuda_available = torch.cuda.is_available()
         if not cuda_available:
@@ -142,7 +142,7 @@ class RAGPipelineV2:
             device=self.reranker_device,
             batch_size=4,
             timeout_seconds=60,
-            auto_offload=self.reranker_auto_offload,  # NEW
+            auto_clear_cache=self.reranker_auto_clear_cache,
         )
         
         # 5. Generator
