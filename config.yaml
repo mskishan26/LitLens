@@ -1,5 +1,5 @@
 paths:
-  data_root: "/scratch/sathishbabu.ki/data_files"
+  data_root: "/scratch/sathishbabu.ki/data_files" # need to change this when deploying to modal
   cleaned_md: "${paths.data_root}/cleaned_md"
   embeddings: "${paths.data_root}/embeddings"
   bm25_artifacts: "${paths.data_root}/bm25_artifacts"
