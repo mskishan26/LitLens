@@ -58,7 +58,7 @@ def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
         possible_paths = [
             Path("config.yaml"),                    # Current dir
             Path("/root/app/config.yaml"),          # Modal mount root
-            Path(__file__).parent.parent / "config.yaml"  # Relative to this file
+            Path(__file__).parent / "config.yaml"  # Relative to this file
         ]
         
         for p in possible_paths:

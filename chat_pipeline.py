@@ -22,15 +22,10 @@ from pathlib import Path
 from typing import List, Dict, Optional, Set, Any, AsyncGenerator, Tuple
 from dataclasses import dataclass
 
-from utils.logger import (
-    get_logger, 
-    set_request_context, 
-    clear_request_context,
-)
 from utils.config_loader import load_config
+from utils.logger import get_logger, set_request_context, clear_request_context
 
 logger = get_logger(__name__)
-
 
 def reranker_tracer(a: List[Dict]) -> Dict[str, Dict]:
     """Convert reranker results to tracer format."""
