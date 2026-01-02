@@ -67,10 +67,6 @@ class RAGPipelineV2:
     def __init__(
         self,
         config_path: Optional[str] = None,
-        embedding_device: str = "cpu",
-        reranker_device: str = "cuda",
-        generator_device: str = "cuda",
-        hallucination_device: str = "cpu",
         enable_tracing: bool = True,
         trace_db_path: str = "traces/request_traces.db",
         # Concurrency settings
@@ -83,12 +79,13 @@ class RAGPipelineV2:
         self.models = self.config['models']
         self.retrieval_conf = self.config['retrieval']
         self.gen_conf = self.config['generation']
+        self.devices = self.config['devices']
         
         # Device configuration
-        self.embedding_device = embedding_device
-        self.reranker_device = reranker_device
-        self.generator_device = generator_device
-        self.hallucination_device = hallucination_device
+        self.embedding_device = self.devices['embedding_device']
+        self.reranker_device = self.devices['reranker_device']
+        self.generator_device = self.devices['generator_device']
+        self.hallucination_device = self.devices['hallucination_device']
         self.reranker_auto_offload = reranker_auto_offload
         
         # Components (lazy loaded)

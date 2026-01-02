@@ -5,7 +5,6 @@ from typing import Any, Dict, Optional
 import re
 import logging
 
-# Use a local logger for this module
 logger = logging.getLogger(__name__)
 
 def _resolve_paths(config: Dict[str, Any]) -> Dict[str, Any]:
@@ -51,19 +50,26 @@ def _resolve_paths(config: Dict[str, Any]) -> Dict[str, Any]:
 def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
     """
     Load configuration from yaml file.
-    
     Args:
-        config_path: Path to config file. If None, looks for config.yaml in project root.
-        
-    Returns:
-        Dictionary containing configuration.
+        config_path: Path to config file.
     """
     if config_path is None:
-        # Assume config.yaml is in the src directory (parent of this file's directory)
-        current_dir = Path(__file__).parent
-        project_root = current_dir.parent
-        config_path = project_root / 'config.yaml'
-    
+        # Strategy to find config.yaml in various environments (local vs Modal)
+        possible_paths = [
+            Path("config.yaml"),                    # Current dir
+            Path("/root/app/config.yaml"),          # Modal mount root
+            Path(__file__).parent.parent / "config.yaml"  # Relative to this file
+        ]
+        
+        for p in possible_paths:
+            if p.exists():
+                config_path = p
+                break
+        
+        if config_path is None:
+            # Last resort
+            config_path = Path("config.yaml")
+
     config_path = Path(config_path)
     
     if not config_path.exists():
@@ -75,11 +81,17 @@ def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
     # Resolve variable substitutions
     config = _resolve_paths(config)
     
-    # Set HF_HOME if configured
-    if 'paths' in config and 'huggingface_home' in config['paths']:
-        os.environ['HF_HOME'] = config['paths']['huggingface_home']
-
-    if 'paths' in config and 'logs' in config['paths']:
-        os.environ['RAG_LOG_DIR'] = config['paths']['logs']
+    # --- Environment Injection ---
+    # Critical for Modal: Set HF_HOME so models are downloaded to the Volume
+    if 'paths' in config:
+        if 'huggingface_home' in config['paths']:
+            hf_home = config['paths']['huggingface_home']
+            os.environ['HF_HOME'] = hf_home
+            # Ensure it exists
+            Path(hf_home).mkdir(parents=True, exist_ok=True)
+            
+        if 'logs' in config['paths']:
+            os.environ['RAG_LOG_DIR'] = config['paths']['logs']
+            Path(config['paths']['logs']).mkdir(parents=True, exist_ok=True)
         
     return config

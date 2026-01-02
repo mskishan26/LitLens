@@ -27,34 +27,34 @@ class HallucinationChecker:
         self,
         generator: "AsyncQwenGenerator",
         config_path: Optional[str] = None,
-        hhem_model: str = "vectara/hallucination_evaluation_model",
+        hallucination_model: str = "vectara/hallucination_evaluation_model",
         device: Optional[str] = None,
         threshold: float = 0.5
     ):
         self.config = load_config(config_path)
         self.generator = generator
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        self.hhem_model_name = hhem_model
+        self.model_name = hallucination_model
         self.threshold = threshold
-        self.hhem_model = None
+        self.hallucination_model = None
     
     def _load_hhem(self) -> None:
         """Lazy load HHEM model."""
-        if self.hhem_model is not None:
+        if self.hallucination_model is not None:
             return
         
         from transformers import AutoModelForSequenceClassification
         
-        self.hhem_model = AutoModelForSequenceClassification.from_pretrained(
-            self.hhem_model_name,
+        self.hallucination_model = AutoModelForSequenceClassification.from_pretrained(
+            self.model_name,
             trust_remote_code=True
         )
         
         if self.device == "cuda" and torch.cuda.is_available():
-            self.hhem_model = self.hhem_model.to(self.device)
+            self.hallucination_model = self.hallucination_model.to(self.device)
         
-        self.hhem_model.eval()
-        logger.info(f"HHEM model loaded: {self.hhem_model_name}")
+        self.hallucination_model.eval()
+        logger.info(f"HHEM model loaded: {self.model_name}")
     
     async def _split_claims(self, answer: str) -> List[str]:
         """Split answer into claims using the generator."""
@@ -124,7 +124,7 @@ class HallucinationChecker:
         pairs = [(doc, claim) for claim in claims for doc in documents]
         
         with torch.no_grad():
-            scores = self.hhem_model.predict(pairs)
+            scores = self.hallucination_model.predict(pairs)
         
         if isinstance(scores, torch.Tensor):
             scores = scores.cpu().tolist()
@@ -202,9 +202,9 @@ class HallucinationChecker:
     
     def cleanup(self) -> None:
         """Free HHEM model memory."""
-        if self.hhem_model is not None:
-            del self.hhem_model
-            self.hhem_model = None
+        if self.hallucination_model is not None:
+            del self.hallucination_model
+            self.hallucination_model = None
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 

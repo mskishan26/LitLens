@@ -14,14 +14,20 @@ models:
   embedding: "infgrad/Jasper-Token-Compression-600M"
   reranker: "jinaai/jina-reranker-v3"
   generator: "Qwen/Qwen3-4B-AWQ"
-  # generator: "Qwen/Qwen2.5-14B-Instruct-1M" # commented to reduce memory constraint
+  hallucination_eval: "vectara/hallucination_evaluation_model"
+
+devices:
+  embedding_device: "cpu"
+  reranker_device: "cuda"
+  generator_device: "cuda"
+  hallucination_device: "cpu"
 
 retrieval:
-  k_papers: 30
-  m_chunks: 20
-  n_reranked: 5
-  bm25_weight: 0.3
-  embedding_weight: 0.7
+  k_papers: 30 # for stage 1 paper retrieval - bm25 + paper embedding
+  m_chunks: 20 # for stage 2 chunk retrieval - chunk embedding
+  n_reranked: 5 # for stage 3 number of top chunks to rerank and use for generation
+  bm25_weight: 0.3 # weight for bm25 score in combined scoring
+  embedding_weight: 0.7   # weight for embedding score in combined scoring
   truncate_dim: 1024
 
 generation:
