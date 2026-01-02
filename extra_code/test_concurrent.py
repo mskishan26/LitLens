@@ -273,7 +273,7 @@ class RAGPipelineWithSplit:
         from inference.embedding_search import EmbeddingSearch
         from inference.reranker import Reranker
         from inference.generator import AsyncQwenGenerator
-        from hallucination_checker import HallucinationChecker
+        from inference.hallucination_checker import HallucinationChecker
         
         print("Initializing pipeline components...")
         
