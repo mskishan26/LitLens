@@ -1,5 +1,5 @@
 paths:
-  data_root: "/scratch/sathishbabu.ki/data_files" # need to change this when deploying to modal
+  data_root: "/mnt/e/data_files" # need to change this when deploying to modal - currently set for laptop config, not explorer
   cleaned_md: "${paths.data_root}/cleaned_md"
   embeddings: "${paths.data_root}/embeddings"
   bm25_artifacts: "${paths.data_root}/bm25_artifacts"
@@ -7,13 +7,14 @@ paths:
   logs: "${paths.data_root}/logs/"
   traces: "${paths.data_root}/logs/"
   session_logs: "${paths.data_root}/session_logs"
-  huggingface_home: "/scratch/sathishbabu.ki/vllm_models/vllm/.cache/huggingface"
   workdir: "/home/ksathish/LitLens"
+  local_model_path: "/scratch/sathishbabu.ki/vllm_models/vllm/.cache/huggingface/hub" # path where models are cached locally on explorer
+  modal_model_path: "/models" # path where models are cached on modal
+  modal_data_path: "/models" # path where data is stored on modal
 
 models:
   embedding: 
     id: "infgrad/Jasper-Token-Compression-600M"
-    path: "/scratch/sathishbabu.ki/vllm_models/vllm/.cache/huggingface/hub/models--infgrad--Jasper-Token-Compression-600M/snapshots/e1373068c35fba2a37568da4eb4105377e17eae9"
     revision: "e1373068c35fba2a37568da4eb4105377e17eae9"
   reranker: 
     id: "jinaai/jina-reranker-v3"

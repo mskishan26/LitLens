@@ -28,7 +28,8 @@ async def run_query(pipeline: RAGPipelineV2, query_text: str, delay: float = 0):
     try:
         async for update in pipeline.answer_stream(
             query=query_text,
-            conversation_id=f"session-{query_id}"
+            conversation_id=f"session-{query_id}",
+            enable_hallucination_check=True
         ):
             current_time = time.perf_counter() - start_time
             msg_type = update.get("type")

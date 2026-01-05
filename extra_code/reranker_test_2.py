@@ -168,11 +168,11 @@ def main():
     clear_gpu_memory()
     
     try:
-        from reranker import Reranker
+        from inference.reranker import Reranker
         
         start_load = time.perf_counter()
         reranker = Reranker(
-            model_name="jinaai/jina-reranker-v3",  # or v3 if you prefer
+            model="jinaai/jina-reranker-v3",
             device=device,
             batch_size=8,
             max_length=1024,

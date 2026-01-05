@@ -20,18 +20,19 @@ app = modal.App("model-sync-manager")
     timeout=3600,
     secrets=[modal.Secret.from_name("huggingface")]
 )
-def sync_models(model_list: list[str]):
+def sync_models(model_dict: dict):
     from huggingface_hub import snapshot_download
     import os
 
-    for repo_id in model_list:
-        print(f"Checking/Downloading: {repo_id}")
-        target_dir = MODEL_DIR / repo_id
+    for model in model_dict.values():
+        print(f"Checking/Downloading: {model['id']}")
+        target_dir = model['path']
         
         # snapshot_download automatically checks if files exist
         snapshot_download(
-            repo_id=repo_id, 
+            repo_id=model['id'], 
             local_dir=target_dir,
+            revision=model['revision'],
             # This ensures we don't redownload everything if it's already there
             local_files_only=False 
         )
@@ -42,16 +43,43 @@ def sync_models(model_list: list[str]):
 
 # 3. The Orchestrator (Runs locally)
 @app.local_entrypoint()
-def main():
+def model_download():
     try:
         from utils.config_loader import load_config
         config = load_config()
-        model_names = list(config['models'].values())
-    except ImportError:
-        # Fallback for testing SHOULD I KEEP THIS SINCE MY GITHUB ACTIONS AS TO TECHNICALLY THROW AN ERROR AND GRACEFULLY HANDLE IT
-        model_names = ["hf-internal-testing/tiny-random-GPTNeoXForCausalLM"]
-
+        model_names = config['models']
+    except ImportError as e:
+        print(f"Critical Error: Could not find 'utils.config_loader'. Ensure the folder exists. {e}")
+        raise # Stops execution and alerts Modal/CI-CD
+    except FileNotFoundError as e:
+        print(f"Critical Error: Configuration file missing. {e}")
+        raise
+    except KeyError as e:
+        print(f"Critical Error: Your config is missing the expected key: {e}")
+        raise
+    except Exception as e:
+        print(f"An unexpected error occurred: {e}")
+        raise
     print(f"Found {len(model_names)} models in config. Starting sync...")
     
     # Trigger the remote Modal function
-    sync_models.remote(model_names)
+    sync_models.remote(model_names) 
+    
+@app.local_entrypoint()
+def upload_data():
+    from utils.config_loader import load_config
+    config = load_config()
+    data_root = Path(config['paths']['data_root'])
+    
+    # Define which sub-folders to sync
+    targets = ["logs", "embeddings", "bm25_artifacts"]
+    
+    data_vol = modal.Volume.from_name("data-storage-vol", create_if_missing=True)
+    
+    with data_vol.batch_upload() as batch:
+        for folder in targets:
+            local_path = data_root / folder
+            if local_path.exists():
+                print(f"Uploading {folder}...")
+                batch.put_directory(local_path, remote_path=f"/{folder}")
+    print("Data sync complete.")

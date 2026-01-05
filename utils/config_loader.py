@@ -1,17 +1,14 @@
 import yaml
 import os
-from pathlib import Path
-from typing import Any, Dict, Optional
 import re
 import logging
+from pathlib import Path
+from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
 def _resolve_paths(config: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Recursively resolve paths in the config dictionary.
-    Replaces ${section.key} with the value from the config.
-    """
+    """Recursively resolve ${section.key} variables."""
     def _get_value(path_str: str, current_config: Dict[str, Any]) -> Any:
         keys = path_str.split('.')
         val = current_config
@@ -28,70 +25,51 @@ def _resolve_paths(config: Dict[str, Any]) -> Dict[str, Any]:
         elif isinstance(item, list):
             return [_replace_vars(i, root_config) for i in item]
         elif isinstance(item, str):
-            # Handle ${var} substitution
             matches = re.findall(r'\${([^}]+)}', item)
             for match in matches:
                 val = _get_value(match, root_config)
                 if val is not None:
                     item = item.replace(f'${{{match}}}', str(val))
-                else:
-                    logger.warning(f"Could not resolve variable '${{{match}}}' in config.")
-            
-            # Handle ~ expansion
             if item.startswith('~/'):
                 item = str(Path.home() / item[2:])
-            
             return item
-        else:
-            return item
+        return item
 
     return _replace_vars(config, config)
 
 def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
-    """
-    Load configuration from yaml file.
-    Args:
-        config_path: Path to config file.
-    """
+    # 1. Standard search for config.yaml
     if config_path is None:
-        # Strategy to find config.yaml in various environments (local vs Modal)
-        possible_paths = [
-            Path("config.yaml"),                    # Current dir
-            Path("/root/app/config.yaml"),          # Modal mount root
-            Path(__file__).parent / "config.yaml"  # Relative to this file
-        ]
-        
-        for p in possible_paths:
-            if p.exists():
-                config_path = p
-                break
-        
-        if config_path is None:
-            # Last resort
-            config_path = Path("config.yaml")
+        possible_paths = [Path("config.yaml"), Path("/root/app/config.yaml"), Path(__file__).parent / "config.yaml"]
+        config_path = next((p for p in possible_paths if p.exists()), Path("config.yaml"))
 
-    config_path = Path(config_path)
-    
-    if not config_path.exists():
-        raise FileNotFoundError(f"Config file not found at {config_path}")
-        
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
-        
-    # Resolve variable substitutions
+
+    # 2. Environment Detection
+    is_modal = os.environ.get("MODAL_IMAGE_ID") is not None
+    
+    if is_modal:
+        # Cloud paths
+        config['paths']['data_root'] = config['paths']['modal_data_path']
+        model_base = config['paths']['modal_model_path']
+    else:
+        # Local/Explorer paths
+        # Note: data_root is already in your YAML as "/mnt/e/data_files"
+        model_base = config['paths']['local_model_path']
+    os.environ['HF_HOME'] = model_base
+    model_base = Path(model_base)
+
+    # 3. Dynamic Model Path Construction
+    # Converts 'org/name' to 'models--org--name' structure
+    if 'models' in config:
+        for m_type, m_info in config['models'].items():
+            if isinstance(m_info, dict) and 'id' in m_info and 'revision' in m_info:
+                hf_folder = f"models--{m_info['id'].replace('/', '--')}"
+                full_path = model_base / hf_folder / "snapshots" / m_info['revision']
+                config['models'][m_type]['path'] = str(full_path)
+
+    # 4. Final variable resolution (like ${paths.data_root})
     config = _resolve_paths(config)
     
-    # --- Environment Injection ---
-    # Critical for Modal: Set HF_HOME so models are downloaded to the Volume
-    if 'paths' in config:
-        if 'huggingface_home' in config['paths']:
-            hf_home = config['paths']['huggingface_home']
-            os.environ['HF_HOME'] = hf_home
-            # Ensure it exists
-            Path(hf_home).mkdir(parents=True, exist_ok=True)
-            
-        if 'logs' in config['paths']:
-            os.environ['RAG_LOG_DIR'] = config['paths']['logs']
-            Path(config['paths']['logs']).mkdir(parents=True, exist_ok=True)
-        
     return config
