@@ -26,12 +26,10 @@ class HallucinationChecker:
     def __init__(
         self,
         generator: "AsyncQwenGenerator",
-        config_path: Optional[str] = None,
         hallucination_model: str = "vectara/hallucination_evaluation_model",
         device: Optional[str] = None,
         threshold: float = 0.5
     ):
-        self.config = load_config(config_path)
         self.generator = generator
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.model_name = hallucination_model

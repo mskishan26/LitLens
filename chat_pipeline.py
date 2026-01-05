@@ -62,26 +62,19 @@ class RAGPipelineV2:
     def __init__(
         self,
         config_path: Optional[str] = None,
-        enable_tracing: bool = True,
-        trace_db_path: str = "traces/request_traces.db",
-        # Concurrency settings
-        max_concurrent_generation: int = 1,
-        reranker_auto_clear_cache: bool = True,
     ):
         self.config = load_config(config_path)
         
         self.paths = self.config['paths']
         self.models = self.config['models']
-        self.retrieval_conf = self.config['retrieval']
-        self.gen_conf = self.config['generation']
-        self.devices = self.config['devices']
+        self.pipeline_config = self.config['pipeline_config']
+        self.setup_config = self.config['setup_config']
         
         # Device configuration
-        self.embedding_device = self.devices['embedding_device']
-        self.reranker_device = self.devices['reranker_device']
-        self.generator_device = self.devices['generator_device']
-        self.hallucination_device = self.devices['hallucination_device']
-        self.reranker_auto_clear_cache = reranker_auto_clear_cache
+        self.embedding_config = self.setup_config['embedding']
+        self.reranker_config = self.setup_config['reranker']
+        self.generator_config = self.setup_config['generator']
+        self.hallucination_config = self.setup_config['hallucination_eval']
         
         # Components (lazy loaded)
         self.bm25: Any = None
@@ -92,11 +85,12 @@ class RAGPipelineV2:
         self.tracer: Any = None
         
         # Tracing
-        self.enable_tracing = enable_tracing
-        self.trace_db_path = trace_db_path
+        self.enable_tracing = self.pipeline_config.get('enable_tracing')
+        if self.enable_tracing:
+            self.trace_db_path = self.paths.get('logs')
         
         # GPU SEMAPHORE - Key for concurrent execution
-        self._gpu_semaphore = asyncio.Semaphore(max_concurrent_generation)
+        self._gpu_semaphore = asyncio.Semaphore(self.pipeline_config.get('max_concurrent_generation', 1))
         self._generation_queue_depth = 0
         self._queue_lock = asyncio.Lock()
 
@@ -130,34 +124,34 @@ class RAGPipelineV2:
         
         # 3. Embedding Search
         self.embedding = EmbeddingSearch(
-            embedding_model_name=self.models['embedding'],
-            device=self.embedding_device,
-            truncate_dim=self.retrieval_conf.get('truncate_dim')
+            embedding_model_name=self.models['embedding'].get('path') or 
+                                 self.models['embedding']['id'],
+            **self.embedding_config
+            
         )
         self.embedding.load(Path(self.paths['embeddings']))
         
         # 4. Reranker (with auto-offload support)
         self.reranker = Reranker(
-            model_name=self.models['reranker'],
-            device=self.reranker_device,
-            batch_size=4,
-            timeout_seconds=60,
-            auto_clear_cache=self.reranker_auto_clear_cache,
+            model_name=self.models['reranker'].get('path') or 
+                       self.models['reranker']['id'],
+            **self.reranker_config,
         )
         
         # 5. Generator
         self.generator = AsyncQwenGenerator(
-            model_name=self.models['generator'],
-            gpu_memory_utilization=0.4,
-            tensor_parallel_size=1
+            model_name=self.models['generator'].get('path') or 
+                       self.models['generator']['id'],
+            **self.generator_config,
         )
         await self.generator.initialize()
         
         # 6. Hallucination Checker
         self.hallucination_checker = HallucinationChecker(
             generator=self.generator,
-            device=self.hallucination_device,
-            threshold=self.config.get('hallucination', {}).get('threshold', 0.5)
+            hallucination_model=self.models['hallucination_eval'].get('path') or 
+                              self.models['hallucination_eval']['id'],
+            **self.hallucination_config,
         )
         
         logger.info("Pipeline V2 initialized (concurrent mode enabled)")
@@ -224,7 +218,7 @@ class RAGPipelineV2:
         bm25_start = time.perf_counter()
         bm25_output = self.bm25.search(
             query, 
-            k=self.retrieval_conf['k_papers'] * 2
+            k=self.pipeline_config['k_papers'] * 2
         )
         bm25_results, bm25_scores = map(list, zip(*bm25_output))
         bm25_duration = (time.perf_counter() - bm25_start) * 1000
@@ -237,7 +231,7 @@ class RAGPipelineV2:
         emb_paper_results = self.embedding.search(
             query, 
             collection_num=1, 
-            k=self.retrieval_conf['k_papers'] * 2
+            k=self.pipeline_config['k_papers'] * 2
         )
         emb_duration = (time.perf_counter() - emb_start) * 1000
         
@@ -250,7 +244,7 @@ class RAGPipelineV2:
         # Hybrid Fusion
         selected_papers, fusion_scores = self._hybrid_fusion(
             bm25_results, emb_paper_results, 
-            k=self.retrieval_conf['k_papers'],
+            k=self.pipeline_config['k_papers'],
             return_scores=True
         )
         
@@ -264,7 +258,7 @@ class RAGPipelineV2:
         chunk_results = self.embedding.search(
             query,
             collection_num=2,
-            k=self.retrieval_conf['m_chunks'],
+            k=self.pipeline_config['m_chunks'],
             file_path_filter=selected_papers
         )
         chunk_duration = (time.perf_counter() - chunk_start) * 1000
@@ -285,7 +279,7 @@ class RAGPipelineV2:
         reranked_results = self.reranker.rerank_with_details(
             query,
             candidates=chunk_results,
-            top_k=self.retrieval_conf['n_reranked']
+            top_k=self.pipeline_config['n_reranked']
         )
         rerank_duration = (time.perf_counter() - rerank_start) * 1000
         

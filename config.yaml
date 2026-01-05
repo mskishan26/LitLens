@@ -1,35 +1,61 @@
-paths:
-  data_root: "/scratch/sathishbabu.ki/data_files" # need to change this when deploying to modal
-  cleaned_md: "${paths.data_root}/cleaned_md"
-  embeddings: "${paths.data_root}/embeddings"
-  bm25_artifacts: "${paths.data_root}/bm25_artifacts"
-  outputs: "${paths.data_root}/outputs"
-  logs: "${paths.data_root}/logs/"
-  traces: "${paths.data_root}/logs/"
-  session_logs: "${paths.data_root}/session_logs"
-  huggingface_home: "/scratch/sathishbabu.ki/vllm_models/vllm/.cache/huggingface"
-  workdir: "/home/ksathish/LitLens"
+# paths:
+#   data_root: "/scratch/sathishbabu.ki/data_files" # need to change this when deploying to modal
+#   cleaned_md: "${paths.data_root}/cleaned_md"
+#   embeddings: "${paths.data_root}/embeddings"
+#   bm25_artifacts: "${paths.data_root}/bm25_artifacts"
+#   outputs: "${paths.data_root}/outputs"
+#   logs: "${paths.data_root}/logs/"
+#   traces: "${paths.data_root}/logs/"
+#   session_logs: "${paths.data_root}/session_logs"
+#   huggingface_home: "/scratch/sathishbabu.ki/vllm_models/vllm/.cache/huggingface"
+#   workdir: "/home/ksathish/LitLens"
 
 models:
-  embedding: "infgrad/Jasper-Token-Compression-600M"
-  reranker: "jinaai/jina-reranker-v3"
-  generator: "Qwen/Qwen3-4B-AWQ"
-  hallucination_eval: "vectara/hallucination_evaluation_model"
+  embedding: 
+    id: "infgrad/Jasper-Token-Compression-600M"
+    path: "/home/ksathish/llm_models/.cache/huggingface/hub/models--infgrad--Jasper-Token-Compression-600M/snapshots/e1373068c35fba2a37568da4eb4105377e17eae9"
+    revision: "e1373068c35fba2a37568da4eb4105377e17eae9"
+  reranker: 
+    id: "jinaai/jina-reranker-v3"
+    path: "/home/ksathish/llm_models/.cache/huggingface/hub/models--jinaai--jina-reranker-v3/snapshots/050e171c4f75dfec5b648ed8470a2475e5a30f30"
+    revision: "050e171c4f75dfec5b648ed8470a2475e5a30f30"
+  generator: 
+    id: "Qwen/Qwen3-4B-AWQ"
+    path: "/home/ksathish/llm_models/.cache/huggingface/hub/models--Qwen--Qwen3-4B-AWQ/snapshots/74d4bd2bd4bff9cafc9345221320bffb08b406a3"
+    revision: "74d4bd2bd4bff9cafc9345221320bffb08b406a3"
+  hallucination_eval: 
+    id: "vectara/hallucination_evaluation_model"
+    path: "/home/ksathish/llm_models/.cache/huggingface/hub/models--vectara--hallucination_evaluation_model/snapshots/8e4a2e6e96c708cc76c2344f7e4757df2515292c"
+    revision: "8e4a2e6e96c708cc76c2344f7e4757df2515292c"
 
-devices:
-  embedding_device: "cpu"
-  reranker_device: "cuda"
-  generator_device: "cuda"
-  hallucination_device: "cpu"
+setup_config:
+  embedding:
+    device: "cpu"
+    truncate_dim: 1024
+  reranker:
+    device: "cuda"
+    batch_size: 8
+    timeout_seconds: 30
+    max_workers: 1
+    auto_clear_cache: true
+  generator:
+    max_new_tokens: 800
+    temperature: 0.4
+    top_p: 0.7
+    tensor_parallel_size: 1
+    gpu_memory_utilization: 0.4
+    max_model_len: 8000
+  hallucination_eval:
+    device: "cpu"
+    threshold: 0.5
 
-retrieval:
+pipeline_config:
   k_papers: 30 # for stage 1 paper retrieval - bm25 + paper embedding
   m_chunks: 20 # for stage 2 chunk retrieval - chunk embedding
   n_reranked: 5 # for stage 3 number of top chunks to rerank and use for generation
   bm25_weight: 0.3 # weight for bm25 score in combined scoring
   embedding_weight: 0.7   # weight for embedding score in combined scoring
   truncate_dim: 1024
-
-generation:
-  temperature: 0.4
   include_citations: true
+  enable_tracing: true
+  max_concurrent_generation: 1

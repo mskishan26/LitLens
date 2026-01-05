@@ -35,21 +35,17 @@ class Reranker:
     
     def __init__(
         self,
-        config_path: Optional[str] = None,
-        model_name: str = "jinaai/jina-reranker-v3",
+        model: str,
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
         batch_size: int = 8,
-        max_length: int = 1024,
         timeout_seconds: int = 30,
         max_workers: int = 1,
         auto_clear_cache: bool = True,  # Clear GPU cache after each rerank
     ):
-        self.config = load_config(config_path) if config_path else {}
-        model_name = model_name or self.config.get('models', {}).get('reranker', 'jinaai/jina-reranker-v3')
+        model_name = model
         
         self.device = device
         self.batch_size = batch_size
-        self.max_length = max_length
         self.timeout_seconds = timeout_seconds
         self.auto_clear_cache = auto_clear_cache
         
@@ -59,6 +55,11 @@ class Reranker:
         
         logger.info(f"Loading Jina reranker model '{model_name}' on {device}")
         
+        # I tried to experiment to see if the model was using eager attention instead of fa1, but it uses
+        # sdpa by default so we should be good
+        # Another thing we need to keep in mind is that jina reranker has a internal token limit of
+        # 512 tokens for query and 2048 for passages so we can leave the truncation to it
+        # but we cannot increase the text length just because our embedding model supports it
         self.model = AutoModel.from_pretrained(
             model_name,
             torch_dtype=torch.float16 if device == 'cuda' else torch.float32,

@@ -43,23 +43,15 @@ class GeneratorError(Exception):
 class AsyncQwenGenerator:
     """Async Qwen generator with streaming support for RAG chatbot."""
     
-    # Configuration constants
-    DEFAULT_MODEL = "Qwen/Qwen2.5-7B-Instruct"
-    DEFAULT_MAX_TOKENS = 1024
-    DEFAULT_TEMPERATURE = 0.3
-    DEFAULT_TOP_P = 0.9
-    MAX_CONTEXT_WINDOW = 8_000
-    
     def __init__(
         self,
-        config_path: Optional[str] = None,
         model_name: Optional[str] = None,
         max_new_tokens: Optional[int] = None,
-        temperature: Optional[float] = None,
-        top_p: Optional[float] = None,
+        temperature: Optional[float] = 0.4,
+        top_p: Optional[float] = 0.7,
         tensor_parallel_size: int = 1,
         gpu_memory_utilization: float = 0.9,
-        max_model_len: Optional[int] = MAX_CONTEXT_WINDOW,
+        max_model_len: Optional[int] = 8_000,
     ):
         """
         Initialize async Qwen generator.
@@ -74,12 +66,11 @@ class AsyncQwenGenerator:
             gpu_memory_utilization: Fraction of GPU memory to use (0.0-1.0)
             max_model_len: Maximum sequence length
         """
-        self.config = load_config(config_path)
         
         # Load configuration
-        self.model_name = model_name or self.config['models']['generator']
-        self.max_new_tokens = max_new_tokens or self.DEFAULT_MAX_TOKENS
-        self.temperature = temperature if temperature is not None else self.config['generation']['temperature']
+        self.model_name = model_name
+        self.max_new_tokens = max_new_tokens
+        self.temperature = temperature
         self.top_p = top_p or self.DEFAULT_TOP_P
         self.tensor_parallel_size = tensor_parallel_size
         self.gpu_memory_utilization = gpu_memory_utilization
