@@ -21,6 +21,7 @@ import gc
 from pathlib import Path
 from typing import List, Dict, Optional, Set, Any, AsyncGenerator, Tuple
 from dataclasses import dataclass
+import os
 
 from utils.config_loader import load_config
 from utils.logger import get_logger, set_request_context, clear_request_context
@@ -87,7 +88,7 @@ class RAGPipelineV2:
         # Tracing
         self.enable_tracing = self.pipeline_config.get('enable_tracing')
         if self.enable_tracing:
-            self.trace_db_path = self.paths.get('logs')
+            self.trace_db_path = os.path.join(self.paths.get('logs'), 'traces.db')
         
         # GPU SEMAPHORE - Key for concurrent execution
         self._gpu_semaphore = asyncio.Semaphore(self.pipeline_config.get('max_concurrent_generation', 1))
@@ -133,7 +134,7 @@ class RAGPipelineV2:
         
         # 4. Reranker (with auto-offload support)
         self.reranker = Reranker(
-            model_name=self.models['reranker'].get('path') or 
+            model=self.models['reranker'].get('path') or 
                        self.models['reranker']['id'],
             **self.reranker_config,
         )
@@ -360,8 +361,8 @@ class RAGPipelineV2:
             async for token in self.generator.generate_streaming(
                 query=query,
                 contexts=reranked_results,
-                temperature=self.gen_conf['temperature'],
-                include_citations=self.gen_conf['include_citations']
+                temperature=self.generator_config['temperature'],
+                include_citations=self.pipeline_config['include_citations']
             ):
                 if ttft is None:
                     ttft = (time.perf_counter() - gen_start) * 1000
@@ -499,8 +500,8 @@ class RAGPipelineV2:
     ) -> Tuple[Set[str], Dict[str, float]] | Set[str]:
         """Fuse BM25 and embedding results using weighted rank fusion."""
         scores = {}
-        bm25_w = self.retrieval_conf['bm25_weight']
-        emb_w = self.retrieval_conf['embedding_weight']
+        bm25_w = self.pipeline_config['bm25_weight']
+        emb_w = self.pipeline_config['embedding_weight']
         
         for rank, file_path in enumerate(bm25_list):
             score = 1.0 - (rank / len(bm25_list))
