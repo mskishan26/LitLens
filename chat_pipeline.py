@@ -125,33 +125,31 @@ class RAGPipelineV2:
         
         # 3. Embedding Search
         self.embedding = EmbeddingSearch(
-            embedding_model_name=self.models['embedding'].get('path') or 
-                                 self.models['embedding']['id'],
+            embedding_model_name=self.models['embedding'].get('path') or self.models['embedding']['id'],
             **self.embedding_config
-            
         )
         self.embedding.load(Path(self.paths['embeddings']))
         
         # 4. Reranker (with auto-offload support)
         self.reranker = Reranker(
-            model=self.models['reranker'].get('path') or 
-                       self.models['reranker']['id'],
+            model=self.models['reranker'].get('path') or self.models['reranker']['id'],
             **self.reranker_config,
         )
         
         # 5. Generator
         self.generator = AsyncQwenGenerator(
-            model_name=self.models['generator'].get('path') or 
-                       self.models['generator']['id'],
+            model_name=self.models['generator'].get('path') or self.models['generator']['id'],
             **self.generator_config,
         )
         await self.generator.initialize()
         
+        # Warmup to capture CUDA graphs immediately
+        await self.warmup()
+        
         # 6. Hallucination Checker
         self.hallucination_checker = HallucinationChecker(
             generator=self.generator,
-            hallucination_model=self.models['hallucination_eval'].get('path') or 
-                              self.models['hallucination_eval']['id'],
+            hallucination_model=self.models['hallucination_eval'].get('path') or self.models['hallucination_eval']['id'],
             **self.hallucination_config,
         )
         
@@ -160,8 +158,6 @@ class RAGPipelineV2:
     async def cleanup(self):
         """Free all resources."""
         import torch
-        import torch.distributed as dist
-
         logger.info("Cleaning up pipeline resources...")
         
         if self.hallucination_checker:
@@ -183,6 +179,29 @@ class RAGPipelineV2:
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+    
+    async def warmup(self):
+        """
+        Run a dummy generation to force vLLM to capture CUDA graphs.
+        This prevents the 'Capturing CUDA graphs' lag during the first user query.
+        """
+        logger.info("Starting vLLM warmup sequence...")
+        try:
+            # We acquire the semaphore to ensure warmup respects the concurrency lock
+            async with self._gpu_semaphore:
+                # Use a dummy context and query to trigger the generation path
+                # Short tokens are enough to trigger graph capture
+                dummy_contexts = [{"text": "Warmup context", "metadata": {}, "score": 1.0}]
+                async for _ in self.generator.generate_streaming(
+                    query="warmup",
+                    contexts=dummy_contexts,
+                    temperature=0.7,
+                    max_tokens=5
+                ):
+                    pass
+            logger.info("vLLM warmup complete. CUDA graphs captured.")
+        except Exception as e:
+            logger.error(f"Warmup failed: {e}")
 
     # =========================================================================
     # STAGE 1-3: RETRIEVAL (Can run concurrently for multiple queries)

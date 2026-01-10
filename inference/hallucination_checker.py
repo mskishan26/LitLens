@@ -1,6 +1,6 @@
 """
 Hallucination Checker - Simplified
-Uses HHEM-2.1-Open to verify claims against source documents.
+Uses HHEM-2.1-Open to verify claims.
 """
 
 import torch
@@ -9,9 +9,9 @@ import uuid
 import time
 from typing import List, Dict, Optional, Any
 from vllm.sampling_params import SamplingParams
+from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
 from utils.logger import get_logger
-from utils.config_loader import load_config
 
 logger = get_logger(__name__)
 
@@ -35,14 +35,26 @@ class HallucinationChecker:
         self.model_name = hallucination_model
         self.threshold = threshold
         self.hallucination_model = None
+        self.tokenizer = None
     
     def _load_hhem(self) -> None:
-        """Lazy load HHEM model."""
+        """Lazy load HHEM model and tokenizer."""
         if self.hallucination_model is not None:
             return
         
-        from transformers import AutoModelForSequenceClassification
-        
+        # Explicitly load Tokenizer and force model_max_length
+        # HHEM-2.1 supports long context, but config defaults to 512.
+        try:
+            logger.info(f"Loading HHEM tokenizer from {self.model_name}...")
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                self.model_name, 
+                trust_remote_code=True, 
+                model_max_length=8192
+            )
+        except Exception as e:
+            logger.warning(f"Could not load custom tokenizer, falling back to default: {e}")
+
+        logger.info(f"Loading HHEM model from {self.model_name}...")
         self.hallucination_model = AutoModelForSequenceClassification.from_pretrained(
             self.model_name,
             trust_remote_code=True
@@ -52,7 +64,7 @@ class HallucinationChecker:
             self.hallucination_model = self.hallucination_model.to(self.device)
         
         self.hallucination_model.eval()
-        logger.info(f"HHEM model loaded: {self.model_name}")
+        logger.info("HHEM model loaded successfully.")
     
     async def _split_claims(self, answer: str) -> List[str]:
         """Split answer into claims using the generator."""
@@ -66,24 +78,15 @@ class HallucinationChecker:
         
         try:
             prompt = self.generator.tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=True,
-                enable_thinking=False
+                messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
             )
         except TypeError:
-            # Fallback if tokenizer doesn't support enable_thinking
             prompt = self.generator.tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=True
+                messages, tokenize=False, add_generation_prompt=True
             )
         
         sampling_params = SamplingParams(
-            temperature=0.1,
-            top_p=0.9,
-            max_tokens=1024,
-            skip_special_tokens=True
+            temperature=0.1, top_p=0.9, max_tokens=1024, skip_special_tokens=True
         )
         
         request_id = str(uuid.uuid4())
@@ -92,7 +95,6 @@ class HallucinationChecker:
         async for output in self.generator.engine.generate(prompt, sampling_params, request_id=request_id):
             claims_text = output.outputs[0].text
         
-        # Parse numbered list
         claims = []
         for line in claims_text.strip().split('\n'):
             match = re.match(r'^\s*\d+[\.\)]\s*(.+)$', line.strip())
@@ -101,33 +103,41 @@ class HallucinationChecker:
                 if claim and len(claim) > 5:
                     claims.append(claim)
         
-        # Deduplicate
         seen = set()
         return [c for c in claims if not (c.lower() in seen or seen.add(c.lower()))]
     
     def _verify_claims(self, claims: List[str], documents: List[str]) -> List[Dict]:
         """Verify claims against documents using HHEM."""
-        if not claims:
-            return []
-        
+        if not claims: return []
         if not documents:
-            return [
-                {"claim": c, "is_grounded": False, "max_score": 0.0, "supporting_docs": []}
-                for c in claims
-            ]
+            return [{"claim": c, "is_grounded": False, "max_score": 0.0, "supporting_docs": []} for c in claims]
         
         self._load_hhem()
         
-        # Create (doc, claim) pairs
-        pairs = [(doc, claim) for claim in claims for doc in documents]
+        pairs = [[doc, claim] for claim in claims for doc in documents]
         
         with torch.no_grad():
-            scores = self.hallucination_model.predict(pairs)
+            if self.tokenizer:
+                inputs = self.tokenizer(
+                    pairs, 
+                    return_tensors="pt", 
+                    padding=True, 
+                    truncation=True, 
+                    max_length=8192 
+                )
+                if self.device == "cuda":
+                    inputs = {k: v.to(self.device) for k, v in inputs.items()}
+                
+                outputs = self.hallucination_model(**inputs)
+                scores = torch.sigmoid(outputs.logits).squeeze()
+            else:
+                scores = self.hallucination_model.predict(pairs)
         
         if isinstance(scores, torch.Tensor):
             scores = scores.cpu().tolist()
+        if isinstance(scores, float): 
+            scores = [scores]
         
-        # Organize scores by claim
         num_docs = len(documents)
         results = []
         
@@ -146,95 +156,46 @@ class HallucinationChecker:
         return results
     
     async def check(self, answer: str, contexts: List[Dict]) -> Dict[str, Any]:
-        """
-        Check answer for hallucinations.
-        
-        Returns dict with: claims, verifications, grounding_ratio, unsupported_claims
-        """
         start = time.perf_counter()
         
-        # Extract document texts
         documents = []
         for ctx in contexts:
             text = ctx.get('text', '') if isinstance(ctx, dict) else ctx
-            if text:
-                documents.append(text)
+            if text: documents.append(text)
         
-        # Split into claims
         try:
             claims = await self._split_claims(answer)
         except Exception as e:
             logger.warning(f"LLM claim splitting failed, using fallback: {e}")
-            # Fallback: simple sentence splitting
             sentences = re.split(r'(?<=[.!?])\s+', answer.strip())
             claims = [s.strip() for s in sentences if len(s.strip()) > 20]
         
         if not claims:
             return {
-                "answer": answer,
-                "claims": [],
-                "verifications": [],
-                "num_claims": 0,
-                "num_grounded": 0,
-                "grounding_ratio": 1.0,
-                "unsupported_claims": [],
+                "answer": answer, "claims": [], "verifications": [], "num_claims": 0,
+                "num_grounded": 0, "grounding_ratio": 1.0, "unsupported_claims": [],
                 "duration_ms": (time.perf_counter() - start) * 1000
             }
         
-        # Verify
         verifications = self._verify_claims(claims, documents)
         
         num_grounded = sum(1 for v in verifications if v["is_grounded"])
         unsupported = [v["claim"] for v in verifications if not v["is_grounded"]]
         
         return {
-            "answer": answer,
-            "claims": claims,
-            "verifications": verifications,
-            "num_claims": len(claims),
-            "num_grounded": num_grounded,
+            "answer": answer, "claims": claims, "verifications": verifications,
+            "num_claims": len(claims), "num_grounded": num_grounded,
             "grounding_ratio": num_grounded / len(claims),
             "unsupported_claims": unsupported,
             "duration_ms": (time.perf_counter() - start) * 1000
         }
     
     def cleanup(self) -> None:
-        """Free HHEM model memory."""
         if self.hallucination_model is not None:
             del self.hallucination_model
             self.hallucination_model = None
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
-
-if __name__ == "__main__":
-    import asyncio
-    import os
-    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-    
-    from inference.generator import AsyncQwenGenerator, async_generator_context
-    
-    async def test():
-        contexts = [
-            {"text": "Matrix suppression is a phenomenon in mass spectrometry where components interfere with ionization."},
-            {"text": "Ion competition effects are a major source of matrix suppression in ESI-MS."}
-        ]
-        
-        answer = (
-            "Matrix suppression is a phenomenon in mass spectrometry. "
-            "Ion competition is a major cause. "
-            "It was discovered in 1985 by Dr. Smith."  # hallucination
-        )
-        
-        async with async_generator_context(tensor_parallel_size=1, gpu_memory_utilization=0.9) as generator:
-            checker = HallucinationChecker(generator=generator, device="cpu")
-            result = await checker.check(answer, contexts)
-            print(result)
-            print(f"Claims: {result['num_claims']}")
-            print(f"Grounded: {result['num_grounded']}")
-            print(f"Ratio: {result['grounding_ratio']:.0%}")
-            print(f"Unsupported: {result['unsupported_claims']}")
-            
-            checker.cleanup()
-    
-    asyncio.run(test())
+        if self.tokenizer is not None:
+            del self.tokenizer
+            self.tokenizer = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()

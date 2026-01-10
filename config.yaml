@@ -10,7 +10,7 @@ paths:
   workdir: "/home/ksathish/LitLens"
   local_model_path: "/scratch/sathishbabu.ki/vllm_models/vllm/.cache/huggingface/hub" # path where models are cached locally on explorer
   modal_model_path: "/models" # path where models are cached on modal
-  modal_data_path: "/models" # path where data is stored on modal
+  modal_data_path: "/data" # path where data is stored on modal
 
 models:
   embedding: 
@@ -18,15 +18,12 @@ models:
     revision: "e1373068c35fba2a37568da4eb4105377e17eae9"
   reranker: 
     id: "jinaai/jina-reranker-v3"
-    path: "/scratch/sathishbabu.ki/vllm_models/vllm/.cache/huggingface/hub/models--jinaai--jina-reranker-v3/snapshots/050e171c4f75dfec5b648ed8470a2475e5a30f30"
     revision: "050e171c4f75dfec5b648ed8470a2475e5a30f30"
   generator: 
     id: "Qwen/Qwen3-4B-AWQ"
-    path: "/scratch/sathishbabu.ki/vllm_models/vllm/.cache/huggingface/hub/models--Qwen--Qwen3-4B-AWQ/snapshots/74d4bd2bd4bff9cafc9345221320bffb08b406a3"
     revision: "74d4bd2bd4bff9cafc9345221320bffb08b406a3"
   hallucination_eval: 
     id: "vectara/hallucination_evaluation_model"
-    path: "/scratch/sathishbabu.ki/vllm_models/vllm/.cache/huggingface/hub/models--vectara--hallucination_evaluation_model/snapshots/8e4a2e6e96c708cc76c2344f7e4757df2515292c"
     revision: "8e4a2e6e96c708cc76c2344f7e4757df2515292c"
 
 setup_config:
@@ -44,10 +41,10 @@ setup_config:
     temperature: 0.4
     top_p: 0.7
     tensor_parallel_size: 1
-    gpu_memory_utilization: 0.4
+    gpu_memory_utilization: 0.5
     max_model_len: 8000
   hallucination_eval:
-    device: "cpu"
+    device: "cuda"
     threshold: 0.5
 
 pipeline_config:

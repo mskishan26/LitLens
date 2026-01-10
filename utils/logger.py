@@ -44,7 +44,7 @@ def set_request_context(
     user_id: Optional[str] = None
 ) -> str:
     """Set request context for the current async task / thread."""
-    req_id = req_id or str(uuid.uuid4())[:8]
+    req_id = req_id or str(uuid.uuid4()) #[:8] # birthday paradox
     _req_id.set(req_id)
     
     if conversation_id:
