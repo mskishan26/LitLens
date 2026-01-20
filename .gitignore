@@ -4,5 +4,7 @@ litlens_inference/
 .chainlit/
 logs/
 traces/
+aws/
+.webui_secret_key
 
 __pycache__
